@@ -56,8 +56,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-         
-          cache-dependency-path: tenderpilot-scraper/package.json
 
       # ── Setup Python for ddddocr ─────────────────────────────────────────
       - name: Setup Python
@@ -65,7 +63,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-        
 
       # ── Install Python CAPTCHA solver ────────────────────────────────────
       - name: Install ddddocr
@@ -75,31 +72,28 @@ jobs:
       # ── Install Node dependencies ────────────────────────────────────────
       - name: Install Node dependencies
         if: steps.check.outputs.run == 'true'
-        
         run: npm install
 
       # ── Install Playwright + Chromium ────────────────────────────────────
       - name: Install Playwright Chromium
         if: steps.check.outputs.run == 'true'
-        
         run: npx playwright install chromium --with-deps
 
       # ── Create logs directory ────────────────────────────────────────────
       - name: Create logs directory
         if: steps.check.outputs.run == 'true'
-        run: mkdir -p tenderpilot-scraper/logs
+        run: mkdir -p logs
 
       # ── Run the scraper ──────────────────────────────────────────────────
       - name: Run ${{ matrix.portal }} scraper
         if: steps.check.outputs.run == 'true'
-        
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           CAPTCHA_RETRY_LIMIT: 10
           REQUEST_DELAY_MIN: 2000
           REQUEST_DELAY_MAX: 5000
-        run: node scrapers/${{ matrix.portal }}.js
+        run: node ${{ matrix.portal }}.js
 
       # ── Upload logs as artifact (viewable in GitHub UI) ──────────────────
       - name: Upload scraper logs
@@ -107,5 +101,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: logs-${{ matrix.portal }}-${{ github.run_number }}
-          path: tenderpilot-scraper/logs/
+          path: logs/
           retention-days: 7
