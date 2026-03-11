@@ -9,13 +9,20 @@ const logger                           = require('./logger');
 const BASE_URL = 'https://tntenders.gov.in/nicgep/app';
 
 const SEL = {
+  // Tender rows
   tableRows: 'table tbody tr, table.list_table tbody tr',
+
+  // Fields
   tenderId:    'td:nth-child(1)',
   title:       'td:nth-child(2)',
   org:         'td:nth-child(3)',
   closingDate: 'td:nth-child(4)',
   detailLink:  'a[href*="tntenders"], a[href]',
+
+  // Pagination — TN uses "Active" tabs + next buttons
   nextPage:  '.next-page a, a:has-text("Next"), button[value="Next >"], input[value="Next >"], a:has-text("Active")',
+
+  // CAPTCHA
   captchaImg:    '#captchaImage, img[src*="captcha"], .captchaImgDiv',
   captchaInput:  'input[name="captcha"], #captchaText',
   captchaSubmit: 'input[type="submit"], button[type="submit"]',
@@ -28,11 +35,6 @@ function parseDate(raw) {
   const s = raw.trim().replace(/\s+/g, ' ');
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : d.toISOString();
-}
-
-function safeTenderId(prefix, raw) {
-  const cleaned = `${prefix}-${raw}`.replace(/\s+/g, '');
-  return cleaned.substring(0, 200);
 }
 
 // ── TnScraper ─────────────────────────────────────────────────────────────────
@@ -58,8 +60,10 @@ class TnScraper extends BaseScraper {
       while (true) {
         logger.info(`📄 Scraping TN page ${pageNum}`);
 
+        // Handle CAPTCHA
         await this._handleCaptchaIfPresent();
 
+        // Wait for table rows
         try {
           await this.page.waitForSelector(SEL.tableRows, { timeout: 15000, state: 'attached' });
         } catch {
@@ -106,6 +110,8 @@ class TnScraper extends BaseScraper {
       await this.cleanup();
     }
   }
+
+  // ── Private helpers ──────────────────────────────────────────────────────
 
   async _handleCaptchaIfPresent() {
     try {
@@ -159,7 +165,7 @@ class TnScraper extends BaseScraper {
     } catch {}
 
     return {
-      tender_id:    safeTenderId('TN', rawId),
+      tender_id:    `TN-${rawId}`.replace(/\s+/g, ''),
       title:        rawTitle,
       organization: rawOrg || 'N/A',
       portal:       'tn',
@@ -183,6 +189,8 @@ class TnScraper extends BaseScraper {
     }
   }
 }
+
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 if (require.main === module) {
   const scraper = new TnScraper();

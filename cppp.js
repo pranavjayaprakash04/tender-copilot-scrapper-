@@ -9,14 +9,21 @@ const logger                           = require('./logger');
 const BASE_URL = 'https://eprocure.gov.in/eprocure/app?page=FrontEndTendersByOrganisation';
 
 const SEL = {
+  // Tender table
   tableRows:    'table.list_table tbody tr, tbody tr, table tbody tr',
   tenderTable:  '.tender-table, table.list_table, table tbody',
+
+  // Fields inside each row
   tenderId:     'td:nth-child(1)',
   title:        'td:nth-child(2)',
   org:          'td:nth-child(3)',
   closingDate:  'td:nth-child(4)',
   detailLink:   'a[href*="eprocure"]',
+
+  // Pagination
   nextPage:     '.pagination a[rel="next"], a:has-text("Next"), a[rel="next"]',
+
+  // CAPTCHA
   captchaImg:   '#captchaImage, img[src*="captcha"]',
   captchaInput: '#captchaText, input[name="captcha"]',
   captchaSubmit:'#submitCaptcha, button[type="submit"], input[type="submit"]',
@@ -29,11 +36,6 @@ function parseDate(raw) {
   const s = raw.trim().replace(/\s+/g, ' ');
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : d.toISOString();
-}
-
-function safeTenderId(prefix, raw) {
-  const cleaned = `${prefix}-${raw}`.replace(/\s+/g, '');
-  return cleaned.substring(0, 200);
 }
 
 // ── CpppScraper ───────────────────────────────────────────────────────────────
@@ -59,8 +61,10 @@ class CpppScraper extends BaseScraper {
       while (true) {
         logger.info(`📄 Scraping CPPP page ${pageNum}`);
 
+        // Handle CAPTCHA
         await this._handleCaptchaIfPresent();
 
+        // Wait for table
         try {
           await this.page.waitForSelector(SEL.tableRows, { timeout: 15000, state: 'attached' });
         } catch {
@@ -103,10 +107,13 @@ class CpppScraper extends BaseScraper {
     }
   }
 
+  // ── Private helpers ──────────────────────────────────────────────────────
+
   async _handleCaptchaIfPresent() {
     try {
       const visible = await this.page.isVisible(SEL.captchaImg, { timeout: 3000 });
       if (!visible) return;
+
       logger.warn('🔒 CAPTCHA detected on CPPP — attempting to solve CAPTCHA...');
       await this.solveCaptcha(this.page);
     } catch {
@@ -155,7 +162,7 @@ class CpppScraper extends BaseScraper {
     } catch {}
 
     return {
-      tender_id:     safeTenderId('CPPP', rawId),
+      tender_id:     `CPPP-${rawId}`.replace(/\s+/g, ''),
       title:         rawTitle,
       organization:  rawOrg || 'N/A',
       portal:        'cppp',
@@ -177,6 +184,8 @@ class CpppScraper extends BaseScraper {
     }
   }
 }
+
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 if (require.main === module) {
   const scraper = new CpppScraper();
