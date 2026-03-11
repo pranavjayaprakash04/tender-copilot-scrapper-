@@ -76,7 +76,7 @@ jobs:
       - name: Install Node dependencies
         if: steps.check.outputs.run == 'true'
         
-        run: npm ci
+        run: npm install
 
       # ── Install Playwright + Chromium ────────────────────────────────────
       - name: Install Playwright Chromium
