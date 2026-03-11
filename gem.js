@@ -1,234 +1,132 @@
 require('dotenv').config();
 
-const BaseScraper         = require('./base');
+const axios                            = require('axios');
 const { upsertTenders, logScraperRun } = require('./supabase');
-const logger              = require('./logger');
+const logger                           = require('./logger');
 
-// ── Selectors ────────────────────────────────────────────────────────────────
+// ── GeM AJAX endpoint ─────────────────────────────────────────────────────────
+// bidplus.gem.gov.in/all-bids loads data via an internal paginated endpoint.
+// We call it directly with axios — no browser/Playwright needed.
 
-const SELECTORS = {
-  // Tender list rows
-  tenderRows:   'tbody tr',
-  tenderList:   '.bid-list, .bid-list-item, table tbody tr',
+const BASE        = 'https://bidplus.gem.gov.in';
+const LIST_URL    = `${BASE}/bidding/bid/getBidPageData`;
+const DETAIL_BASE = `${BASE}/bidding/bid/showbidDocument/`;
 
-  // Individual tender fields
-  tenderId:     'td:nth-child(1), [data-field="tender_id"]',
-  title:        'td:nth-child(2), h.bid-title, .tender-row .bid-value',
-  org:          'td:nth-child(3), .org-name',
-  bidEndDate:   '.bid-end-date, td:nth-child(4), [data-date]',
-  estimatedVal: '.estimated-date, td:nth-child(2)',
-  detailLink:   'a[href*="bid"], a[href*="biddetail"]',
-
-  // Pagination
-  nextPage:     '.pagination .next, li.next a, a:has-text("Next"), [rel="Next"], button[aria-label="Next"]',
-
-  // CAPTCHA
-  captchaImg:   'img[src*="captcha-img"], img[src*="captcha"], .captcha-image, .cap-mage',
-  captchaInput: 'input[name="captchaInput"], input[type="text"][name*="captcha"]',
-  captchaSubmit: 'input[type="submit"], button[type="submit"]',
+const HEADERS = {
+  'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'en-IN,en;q=0.9',
+  'Referer':         `${BASE}/all-bids`,
 };
 
-const BASE_URL = 'https://bidplus.gem.gov.in/bidlists';
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function parseDate(raw) {
   if (!raw) return null;
-  const s = raw.trim().replace(/\s+/g, ' ');
-  const d = new Date(s);
+  const d = new Date(raw.trim().replace(/\s+/g, ' '));
   return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-// ── GemScraper ────────────────────────────────────────────────────────────────
+function parseBidCards(html) {
+  const tenders = [];
+  const src = typeof html === 'string' ? html : JSON.stringify(html);
 
-class GemScraper extends BaseScraper {
-  constructor() {
-    super('gem');
+  // Each bid card contains a link like /bidding/bid/showbidDocument/1234567
+  // and structured divs for bid number, title, org, end date
+  const docIdPattern = /showbidDocument\/(\d+)/g;
+  const chunks = src.split(/(?=showbidDocument\/\d+)/);
+
+  for (const chunk of chunks) {
+    const idMatch = chunk.match(/showbidDocument\/(\d+)/);
+    if (!idMatch) continue;
+    const docId = idMatch[1];
+
+    // Bid reference number (GEM/YYYY/B/NNNNN)
+    const numMatch = chunk.match(/(GEM\/\d{4}\/[A-Z]+\/\d+)/i);
+    const bidNum   = numMatch ? numMatch[1].trim() : `GEM-${docId}`;
+
+    // Strip all HTML tags for text extraction
+    const text = chunk.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+
+    // Title: usually the longest meaningful sentence
+    const titleMatch = text.match(/([A-Z][^.!?\n]{20,120})/);
+    const title = titleMatch ? titleMatch[1].trim() : bidNum;
+
+    // Date pattern DD-MM-YYYY HH:MM or similar
+    const dateMatch = text.match(/(\d{2}[\/\-]\d{2}[\/\-]\d{4}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)/);
+    const endDate   = dateMatch ? dateMatch[1] : null;
+
+    tenders.push({
+      tender_id:    bidNum.replace(/\s+/g, ''),
+      title:        title.substring(0, 500),
+      organization: 'GeM',
+      portal:       'gem',
+      bid_end_date: parseDate(endDate),
+      url:          `${DETAIL_BASE}${docId}`,
+      scraped_at:   new Date().toISOString(),
+    });
   }
 
-  async run() {
-    const startTime = Date.now();
-    logger.info('🚀 Starting scraper on GeM');
+  return tenders;
+}
 
-    let totalScraped = 0;
-    let pageNum      = 1;
+async function scrapeGem() {
+  const startTime  = Date.now();
+  let totalScraped = 0;
+  let pageNum      = 1;
 
-    try {
-      await this.launchBrowser();
+  logger.info('🚀 Starting scraper on GeM (HTTP mode — no browser)');
 
-      const reached = await this.navigateTo(BASE_URL);
-      if (!reached) throw new Error('Failed to load GeM bid list page');
+  try {
+    while (true) {
+      logger.info(`📄 Fetching GeM page ${pageNum}`);
 
-      while (true) {
-        logger.info(`📄 Scraping page ${pageNum}`);
-
-        // Handle CAPTCHA if present
-        const hasCaptcha = await this._handleCaptchaIfPresent();
-        if (!hasCaptcha) {
-          logger.warn('CAPTCHA detected on GeM — attempting solve');
-        }
-
-        // Wait for tender rows to appear
+      let html;
+      for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          await this.page.waitForSelector(SELECTORS.tenderRows, { timeout: 15000, state: 'attached' });
-        } catch {
-          logger.warn(`No tender rows found at page ${pageNum} — stopping`);
+          const resp = await axios.get(LIST_URL, {
+            params:  { searchIndex: 'ra', page: pageNum },
+            headers: HEADERS,
+            timeout: 30000,
+          });
+          html = resp.data;
           break;
-        }
-
-        // Extract tenders from current page
-        const tenders = await this._extractTenders();
-        logger.info(`  Found ${tenders.length} tenders scraped on page ${pageNum}`);
-
-        if (tenders.length === 0) {
-          logger.info('No more tenders found — stopping');
-          break;
-        }
-
-        // Save to Supabase
-        if (tenders.length > 0) {
-          await upsertTenders(tenders);
-          totalScraped += tenders.length;
-        }
-
-        // Go to next page
-        const hasNext = await this._goToNextPage();
-        if (!hasNext) {
-          logger.info(`No more pages after page ${pageNum}`);
-          break;
-        }
-
-        pageNum++;
-        await this.randomDelay();
-      }
-
-      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-      logger.info(`✅ GeM scraper done. Total: ${totalScraped} tenders scraped (${duration}s)`);
-
-      await logScraperRun({
-        portal:    'gem',
-        status:    'success',
-        count:     totalScraped,
-        duration_s: parseFloat(duration),
-      });
-
-    } catch (err) {
-      logger.error(`Scraper failed — error: ${err.message}`, { portal: 'gem' });
-
-      await logScraperRun({
-        portal:  'gem',
-        status:  'error',
-        count:   totalScraped,
-        message: err.message,
-      }).catch(() => {});
-
-      process.exit(1);
-
-    } finally {
-      await this.cleanup();
-    }
-  }
-
-  // ── Private helpers ─────────────────────────────────────────────────────────
-
-  async _handleCaptchaIfPresent() {
-    try {
-      const captchaVisible = await this.page.isVisible(SELECTORS.captchaImg, { timeout: 3000 });
-      if (!captchaVisible) return true; // no captcha
-
-      logger.warn('🔒 CAPTCHA detected on GeM — attempting to solve CAPTCHA');
-      await this.solveCaptcha(this.page);
-      return false;
-    } catch {
-      return true; // assume no captcha if detection fails
-    }
-  }
-
-  async _extractTenders() {
-    const tenders = [];
-
-    try {
-      const rows = await this.page.$$(SELECTORS.tenderRows);
-
-      for (const row of rows) {
-        try {
-          const tender = await this._extractTenderData(row);
-          if (tender) tenders.push(tender);
         } catch (err) {
-          logger.warn(`Failed to extract row: ${err.message}`);
+          logger.warn(`GeM page ${pageNum} attempt ${attempt} failed: ${err.message}`);
+          if (attempt < 3) await sleep(5000);
+          else { logger.error(`GeM page ${pageNum} failed after 3 attempts — stopping`); }
         }
       }
-    } catch (err) {
-      logger.error(`extractTenders error: ${err.message}`);
-    }
 
-    return tenders;
-  }
+      if (!html) break;
 
-  async _extractTenderData(row) {
-    const cells = await row.$$('td');
-    if (cells.length < 2) return null;
+      const tenders = parseBidCards(html);
+      logger.info(`  Found ${tenders.length} tenders on page ${pageNum}`);
 
-    const getText = async (el) => {
-      try { return (await el.textContent())?.trim() ?? ''; }
-      catch { return ''; }
-    };
-
-    const rawId      = cells[0] ? await getText(cells[0]) : '';
-    const rawTitle   = cells[1] ? await getText(cells[1]) : '';
-    const rawOrg     = cells[2] ? await getText(cells[2]) : '';
-    const rawEndDate = cells[3] ? await getText(cells[3]) : '';
-    const rawVal     = cells[4] ? await getText(cells[4]) : '';
-
-    // Get detail link
-    let detailUrl = '';
-    try {
-      const link = await row.$('a[href*="bid"], a[href*="biddetail"]');
-      if (link) {
-        const href = await link.getAttribute('href');
-        detailUrl = href?.startsWith('http') ? href : `https://bidplus.gem.gov.in${href}`;
+      if (tenders.length === 0) {
+        logger.info('No tenders parsed — reached end or format changed');
+        break;
       }
-    } catch {}
 
-    if (!rawTitle && !rawId) return null;
+      await upsertTenders(tenders);
+      totalScraped += tenders.length;
 
-    return {
-      tender_id:       `GEM-${rawId}`.replace(/\s+/g, ''),
-      title:           rawTitle,
-      organization:    rawOrg,
-      portal:          'gem',
-      bid_end_date:    parseDate(rawEndDate),
-      estimated_value: rawVal || null,
-      url:             detailUrl || BASE_URL,
-      scraped_at:      new Date().toISOString(),
-    };
-  }
+      if (pageNum >= 50) { logger.info('Reached 50-page limit — stopping'); break; }
 
-  async _goToNextPage() {
-    try {
-      const nextBtn = await this.page.$(SELECTORS.nextPage);
-      if (!nextBtn) return false;
-
-      const isDisabled = await nextBtn.getAttribute('class');
-      if (isDisabled?.includes('active') || isDisabled?.includes('disabled')) return false;
-
-      await nextBtn.click();
-      await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-      return true;
-    } catch {
-      return false;
+      pageNum++;
+      await sleep(2000 + Math.floor(Math.random() * 2000));
     }
+
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    logger.info(`✅ GeM scraper done. Total: ${totalScraped} tenders (${duration}s)`);
+    await logScraperRun({ portal: 'gem', status: 'success', count: totalScraped });
+
+  } catch (err) {
+    logger.error(`GeM scraper failed: ${err.message}`);
+    await logScraperRun({ portal: 'gem', status: 'error', count: totalScraped, message: err.message }).catch(() => {});
+    process.exit(1);
   }
 }
 
-// ── Entry point ──────────────────────────────────────────────────────────────
-
-if (require.main === module) {
-  const scraper = new GemScraper();
-  scraper.run().catch((err) => {
-    logger.error(`Unhandled error: ${err.message}`);
-    process.exit(1);
-  });
-}
-
-module.exports = GemScraper;
+if (require.main === module) scrapeGem();
+module.exports = scrapeGem;
