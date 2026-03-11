@@ -1,11 +1,11 @@
 {
   "name": "tenderpilot-scraper",
   "version": "1.0.0",
+  "description": "Autonomous tender scraper for TenderPilot",
   "dependencies": {
-    "playwright": "^1.40.0",
-    "dotenv": "^16.3.1",
-    "@supabase/supabase-js": "^2.38.0",
-    "winston": "^3.11.0",
-    "axios": "^1.6.0"
+    "@supabase/supabase-js": "^2.43.0",
+    "dotenv": "^16.4.5",
+    "playwright": "^1.44.0",
+    "winston": "^3.13.0"
   }
 }
