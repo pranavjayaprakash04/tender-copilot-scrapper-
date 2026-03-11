@@ -65,7 +65,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+        
 
       # ── Install Python CAPTCHA solver ────────────────────────────────────
       - name: Install ddddocr
