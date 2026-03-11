@@ -75,13 +75,13 @@ jobs:
       # ── Install Node dependencies ────────────────────────────────────────
       - name: Install Node dependencies
         if: steps.check.outputs.run == 'true'
-        working-directory: tenderpilot-scraper
+        
         run: npm ci
 
       # ── Install Playwright + Chromium ────────────────────────────────────
       - name: Install Playwright Chromium
         if: steps.check.outputs.run == 'true'
-        working-directory: tenderpilot-scraper
+        
         run: npx playwright install chromium --with-deps
 
       # ── Create logs directory ────────────────────────────────────────────
@@ -92,7 +92,7 @@ jobs:
       # ── Run the scraper ──────────────────────────────────────────────────
       - name: Run ${{ matrix.portal }} scraper
         if: steps.check.outputs.run == 'true'
-        working-directory: tenderpilot-scraper
+        
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
