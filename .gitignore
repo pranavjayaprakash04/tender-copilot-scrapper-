@@ -1,0 +1,19 @@
+# Secrets — NEVER commit these
+.env
+*.env
+.env.*
+
+# Dependencies
+node_modules/
+
+# Logs
+logs/
+*.log
+
+# Obfuscation artifacts
+obfuscated/
+obfuscate.js
+
+# OS
+.DS_Store
+Thumbs.db
