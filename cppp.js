@@ -4,7 +4,8 @@ const BaseScraper                      = require('./base');
 const { upsertTenders, logScraperRun } = require('./supabase');
 const logger                           = require('./logger');
 
-const BASE_URL = 'https://eprocure.gov.in/eprocure/app?page=FrontEndTendersByOrganisation';
+// FIX: Correct URL — FrontEndTendersByOrganisation was showing org list, not tenders
+const BASE_URL = 'https://eprocure.gov.in/eprocure/app?page=FrontEndLatestActiveTenders&service=page';
 const PORTAL   = 'cppp';
 
 const SEL = {
@@ -167,73 +168,68 @@ class CpppScraper extends BaseScraper {
     };
   }
 
-  // FIX 2: Multi-strategy pagination for CPPP
+  // FIX: CPPP uses Apache Tapestry — pagination via hidden pageIndex input + form submit
   async _goToNextPage(currentPage) {
     try {
       const nextPageNum = currentPage + 1;
 
-      // Strategy 1: exact ">" single character link
-      const allLinks = await this.page.$$('a');
-      for (const link of allLinks) {
-        const text = (await link.textContent().catch(() => '')).trim();
-        if (text === '>') {
-          logger.info(`[CPPP] Clicking ">" next page link`);
-          await link.click();
-          await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-          await this.page.waitForTimeout(1500);
-          return true;
+      // Strategy 1: Tapestry pageIndex hidden input — most common on CPPP
+      const moved = await this.page.evaluate((nextPage) => {
+        // Look for pageIndex or currentPage hidden input
+        const input = document.querySelector(
+          'input[name="pageIndex"], input[name="currentPage"], input[name="page"]'
+        );
+        if (input) {
+          input.value = nextPage;
+          // Find and submit the parent form
+          const form = input.closest('form');
+          if (form) { form.submit(); return true; }
         }
-      }
+        return false;
+      }, nextPageNum);
 
-      // Strategy 2: "Next" text link
-      for (const link of allLinks) {
-        const text = (await link.textContent().catch(() => '')).trim();
-        if (/^next$/i.test(text)) {
-          logger.info(`[CPPP] Clicking "Next" link`);
-          await link.click();
-          await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-          await this.page.waitForTimeout(1500);
-          return true;
-        }
-      }
-
-      // Strategy 3: numbered page link
-      for (const link of allLinks) {
-        const text = (await link.textContent().catch(() => '')).trim();
-        if (text === String(nextPageNum)) {
-          logger.info(`[CPPP] Clicking page number ${nextPageNum}`);
-          await link.click();
-          await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-          await this.page.waitForTimeout(1500);
-          return true;
-        }
-      }
-
-      // Strategy 4: form input with page number
-      const pageInput = await this.page.$('input[name="pageNumber"], input[name="page"]');
-      if (pageInput) {
-        logger.info(`[CPPP] Navigating via page input to page ${nextPageNum}`);
-        await pageInput.fill(String(nextPageNum));
-        await pageInput.press('Enter');
+      if (moved) {
         await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
         await this.page.waitForTimeout(1500);
+        logger.info(`[CPPP] Navigated to page ${nextPageNum} via pageIndex input`);
         return true;
       }
 
-      // Debug: log all links near pagination area
+      // Strategy 2: find ">" or numbered page link by iterating actual handles
+      const allLinks = await this.page.$$('a');
+      for (const link of allLinks) {
+        const text = (await link.textContent().catch(() => '')).trim();
+        if (text === '>' || text === String(nextPageNum) || /^next$/i.test(text)) {
+          logger.info(`[CPPP] Clicking pagination link: "${text}"`);
+          await link.click();
+          await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+          await this.page.waitForTimeout(1500);
+          return true;
+        }
+      }
+
+      // Strategy 3: direct URL with page param
+      const currentUrl = this.page.url();
+      if (currentUrl.includes('pageIndex=') || currentUrl.includes('currentPage=')) {
+        const nextUrl = currentUrl
+          .replace(/pageIndex=\d+/, `pageIndex=${nextPageNum}`)
+          .replace(/currentPage=\d+/, `currentPage=${nextPageNum}`);
+        await this.page.goto(nextUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await this.page.waitForTimeout(1500);
+        logger.info(`[CPPP] Navigated via URL to page ${nextPageNum}`);
+        return true;
+      }
+
+      // Debug: log pagination area
       const paginationLinks = await this.page.$$eval(
         'a', els => els
-          .filter(a => a.closest('td, .pagination, .paginationUL, [class*="page"]'))
+          .filter(a => a.closest('td, .pagination, [class*="page"], [class*="list_footer"]'))
           .map(a => ({ text: a.innerText?.trim(), href: a.href }))
       ).catch(() => []);
 
-      if (paginationLinks.length > 0) {
-        logger.info(`[CPPP] Pagination links found: ${JSON.stringify(paginationLinks.slice(0, 10))}`);
-      } else {
-        logger.info(`[CPPP] No pagination links found on page ${currentPage} — last page`);
-      }
-
+      logger.info(`[CPPP] Pagination links found: ${JSON.stringify(paginationLinks.slice(0, 15))}`);
       return false;
+
     } catch (err) {
       logger.warn(`[CPPP] Pagination error: ${err.message}`);
       return false;
