@@ -187,14 +187,19 @@ class TnScraper extends BaseScraper {
 
   async _extractRow(row) {
     const cells = await row.$$('td');
-    if (cells.length < 5) return null;
-
     const getText = async (el) => {
       try { return (await el.textContent())?.trim().replace(/\s+/g, ' ') ?? ''; }
       catch { return ''; }
     };
 
     const allCells = await Promise.all(cells.map(getText));
+
+    // Debug: log first 5 rows with their cell count and content
+    if (cells.length !== 6) {
+      logger.info(`[TN] Row has ${cells.length} cells: ${JSON.stringify(allCells.map(c => c.substring(0, 40)))}`);
+    }
+
+    if (cells.length < 5) return null;
 
     // From screenshot — 6 columns:
     // [0] S.No
