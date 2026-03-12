@@ -4,7 +4,6 @@ const BaseScraper                      = require('./base');
 const { upsertTenders, logScraperRun } = require('./supabase');
 const logger                           = require('./logger');
 
-// FIX: Use Tenders by Closing Date — no captcha, paginated, same NIC structure as TN
 const BASE_URL = 'https://eprocure.gov.in/eprocure/app?page=FrontEndListTendersbyDate&service=page';
 const PORTAL   = 'cppp';
 
@@ -36,6 +35,53 @@ function isNoise(title) {
 
 const REF_NO_PATTERN = /[A-Z0-9][A-Z0-9\/\-\.\s]{1,}[0-9]/i;
 
+// ─── Estimated value helpers ─────────────────────────────────────
+
+const VALUE_KEYWORDS = [
+  'estimated value', 'estimated cost', 'tender value',
+  'contract value', 'approximate value', 'tender amount',
+  'work value', 'nit value',
+];
+
+function parseAmount(text) {
+  if (!text) return null;
+  text = text.replace(/Rs\.?/gi, '').replace(/₹/g, '').replace(/\/-/g, '').trim();
+  const crore = text.match(/([\d,.]+)\s*(?:crore|crores|cr\.?)\b/i);
+  if (crore) return parseFloat(crore[1].replace(/,/g, '')) * 10_000_000;
+  const lakh = text.match(/([\d,.]+)\s*(?:lakh|lakhs|lac|lacs)\b/i);
+  if (lakh) return parseFloat(lakh[1].replace(/,/g, '')) * 100_000;
+  const plain = text.replace(/,/g, '').match(/[\d.]+/);
+  if (plain) { const v = parseFloat(plain[0]); return isNaN(v) ? null : v; }
+  return null;
+}
+
+async function extractEstimatedValue(page, url) {
+  if (!url || url === BASE_URL) return null;
+  try {
+    const detailPage = await page.context().newPage();
+    await detailPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await detailPage.waitForTimeout(800);
+    const rawText = await detailPage.evaluate((keywords) => {
+      const rows = Array.from(document.querySelectorAll('tr'));
+      for (const row of rows) {
+        const cells = row.querySelectorAll('td, th');
+        if (cells.length < 2) continue;
+        const label = cells[0].innerText?.toLowerCase().trim() || '';
+        const val   = cells[1].innerText?.trim() || '';
+        if (keywords.some(kw => label.includes(kw)) && val) return val;
+      }
+      const match = document.body.innerText.match(/(?:Rs\.?|₹)\s*([\d,]+(?:\.\d+)?)/);
+      return match ? match[1] : null;
+    }, VALUE_KEYWORDS);
+    await detailPage.close();
+    return parseAmount(rawText);
+  } catch {
+    return null;
+  }
+}
+
+// ─── Core helpers ─────────────────────────────────────────────────
+
 function parseDate(raw) {
   if (!raw) return null;
   const m1 = raw.match(/(\d{1,2})[-\s\/](\w{3})[-\s\/](\d{4})/);
@@ -62,8 +108,7 @@ function parseTitleCell(titleCell) {
     title = titleCell.replace(/^\[/, '').replace(/\]$/, '').trim();
   } else if (bracketContents.length === 1) {
     if (bracketContents[0].length < 40 && REF_NO_PATTERN.test(bracketContents[0])) {
-      refNo = bracketContents[0];
-      title = beforeBracket || refNo;
+      refNo = bracketContents[0]; title = beforeBracket || refNo;
     } else {
       title = bracketContents[0];
     }
@@ -73,11 +118,9 @@ function parseTitleCell(titleCell) {
     if (shortBracket && longBracket && shortBracket !== longBracket) {
       refNo = shortBracket; title = longBracket;
     } else {
-      title = beforeBracket || bracketContents[0];
-      refNo = bracketContents[0];
+      title = beforeBracket || bracketContents[0]; refNo = bracketContents[0];
     }
   }
-
   if (!title && beforeBracket.length > 5) title = beforeBracket;
   title = title.replace(/^\[/, '').replace(/\]$/, '').trim();
   return { title, refNo };
@@ -130,7 +173,6 @@ class CpppScraper extends BaseScraper {
           }
 
           if (tenders.length === 0 && pageNum > 1) break;
-
           const hasNext = await this._goToNextPage();
           if (!hasNext) break;
           pageNum++;
@@ -201,14 +243,18 @@ class CpppScraper extends BaseScraper {
             }
             linkIdx++;
 
+            const estimatedValue = await extractEstimatedValue(this.page, detailUrl).catch(() => null);
+            if (estimatedValue) logger.info(`[CPPP] Extracted value ₹${estimatedValue} for "${title.substring(0, 40)}"`);
+
             tenders.push({
-              tender_id:    makeTenderId(refNo, title),
-              title:        title.substring(0, 500),
-              organization: orgClean.substring(0, 200),
-              portal:       PORTAL,
-              bid_end_date: parseDate(closing),
-              url:          (detailUrl || BASE_URL).substring(0, 1000),
-              scraped_at:   new Date().toISOString(),
+              tender_id:       makeTenderId(refNo, title),
+              title:           title.substring(0, 500),
+              organization:    orgClean.substring(0, 200),
+              portal:          PORTAL,
+              bid_end_date:    parseDate(closing),
+              estimated_value: estimatedValue,
+              url:             (detailUrl || BASE_URL).substring(0, 1000),
+              scraped_at:      new Date().toISOString(),
             });
           }
           continue;
@@ -238,14 +284,17 @@ class CpppScraper extends BaseScraper {
           }
         } catch {}
 
+        const estimatedValue = await extractEstimatedValue(this.page, detailUrl).catch(() => null);
+
         tenders.push({
-          tender_id:    makeTenderId(refNo, title),
-          title:        title.substring(0, 500),
-          organization: orgClean.substring(0, 200),
-          portal:       PORTAL,
-          bid_end_date: parseDate(closing),
-          url:          (detailUrl || BASE_URL).substring(0, 1000),
-          scraped_at:   new Date().toISOString(),
+          tender_id:       makeTenderId(refNo, title),
+          title:           title.substring(0, 500),
+          organization:    orgClean.substring(0, 200),
+          portal:          PORTAL,
+          bid_end_date:    parseDate(closing),
+          estimated_value: estimatedValue,
+          url:             (detailUrl || BASE_URL).substring(0, 1000),
+          scraped_at:      new Date().toISOString(),
         });
 
       } catch (err) {
@@ -255,7 +304,6 @@ class CpppScraper extends BaseScraper {
     return tenders;
   }
 
-  // Same ">" pagination as TN — NIC portals use identical pattern
   async _goToNextPage() {
     try {
       const allLinks = await this.page.$$('a');
