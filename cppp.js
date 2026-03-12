@@ -170,36 +170,46 @@ class CpppScraper extends BaseScraper {
   // FIX 2: Multi-strategy pagination for CPPP
   async _goToNextPage(currentPage) {
     try {
-      // Strategy 1: look for exact ">" or "Next" link in pagination
-      const nextEl = await this.page.evaluateHandle(() => {
-        const links = Array.from(document.querySelectorAll('a'));
-        return (
-          links.find(a => a.innerText?.trim() === '>') ||
-          links.find(a => /\bnext\b/i.test(a.innerText?.trim())) ||
-          null
-        );
-      });
-
-      if (nextEl && nextEl.toString() !== 'JSHandle:null') {
-        logger.info(`[CPPP] Clicking next page via link`);
-        await nextEl.click();
-        await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-        await this.page.waitForTimeout(1500);
-        return true;
-      }
-
-      // Strategy 2: look for numbered page link = currentPage + 1
       const nextPageNum = currentPage + 1;
-      const pageLink = await this.page.$(`a:has-text("${nextPageNum}")`);
-      if (pageLink) {
-        logger.info(`[CPPP] Clicking page number ${nextPageNum}`);
-        await pageLink.click();
-        await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-        await this.page.waitForTimeout(1500);
-        return true;
+
+      // Strategy 1: exact ">" single character link
+      const allLinks = await this.page.$$('a');
+      for (const link of allLinks) {
+        const text = (await link.textContent().catch(() => '')).trim();
+        if (text === '>') {
+          logger.info(`[CPPP] Clicking ">" next page link`);
+          await link.click();
+          await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+          await this.page.waitForTimeout(1500);
+          return true;
+        }
       }
 
-      // Strategy 3: check for a form input with page number
+      // Strategy 2: "Next" text link
+      for (const link of allLinks) {
+        const text = (await link.textContent().catch(() => '')).trim();
+        if (/^next$/i.test(text)) {
+          logger.info(`[CPPP] Clicking "Next" link`);
+          await link.click();
+          await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+          await this.page.waitForTimeout(1500);
+          return true;
+        }
+      }
+
+      // Strategy 3: numbered page link
+      for (const link of allLinks) {
+        const text = (await link.textContent().catch(() => '')).trim();
+        if (text === String(nextPageNum)) {
+          logger.info(`[CPPP] Clicking page number ${nextPageNum}`);
+          await link.click();
+          await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+          await this.page.waitForTimeout(1500);
+          return true;
+        }
+      }
+
+      // Strategy 4: form input with page number
       const pageInput = await this.page.$('input[name="pageNumber"], input[name="page"]');
       if (pageInput) {
         logger.info(`[CPPP] Navigating via page input to page ${nextPageNum}`);
@@ -210,7 +220,7 @@ class CpppScraper extends BaseScraper {
         return true;
       }
 
-      // Strategy 4: log all pagination links for debug
+      // Debug: log all links near pagination area
       const paginationLinks = await this.page.$$eval(
         'a', els => els
           .filter(a => a.closest('td, .pagination, .paginationUL, [class*="page"]'))
@@ -219,6 +229,8 @@ class CpppScraper extends BaseScraper {
 
       if (paginationLinks.length > 0) {
         logger.info(`[CPPP] Pagination links found: ${JSON.stringify(paginationLinks.slice(0, 10))}`);
+      } else {
+        logger.info(`[CPPP] No pagination links found on page ${currentPage} — last page`);
       }
 
       return false;
