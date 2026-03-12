@@ -38,6 +38,7 @@ const SKIP_TITLES = new Set([
 // ─── Estimated value helpers ─────────────────────────────────────
 
 const VALUE_KEYWORDS = [
+  'tender value in',
   'estimated value', 'estimated cost', 'tender value',
   'contract value', 'approximate value', 'tender amount',
   'work value', 'nit value',
@@ -45,6 +46,7 @@ const VALUE_KEYWORDS = [
 
 function parseAmount(text) {
   if (!text) return null;
+  if (/^na$/i.test(text.trim())) return null;
   text = text.replace(/Rs\.?/gi, '').replace(/₹/g, '').replace(/\/-/g, '').trim();
   const crore = text.match(/([\d,.]+)\s*(?:crore|crores|cr\.?)\b/i);
   if (crore) return parseFloat(crore[1].replace(/,/g, '')) * 10_000_000;
@@ -55,30 +57,118 @@ function parseAmount(text) {
   return null;
 }
 
-async function extractEstimatedValue(page, url) {
-  if (!url || url === HOME_URL) return null;
+async function extractDetailPageData(page, url, baseUrl) {
+  if (!url || url === baseUrl) return { estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null };
   try {
+    logger.info('[TN] Visiting detail page: ' + url.substring(0, 80));
     const detailPage = await page.context().newPage();
     await detailPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await detailPage.waitForTimeout(800);
-    const rawText = await detailPage.evaluate((keywords) => {
+
+    const result = await detailPage.evaluate((keywords) => {
+      let estimatedValue = null;
+      let category = null;
+      let location = null;
+      let emdAmount = null;
+
+      // ── Scrape ALL table key-value pairs into details object ──
+      const details = {};
       const rows = Array.from(document.querySelectorAll('tr'));
       for (const row of rows) {
-        const cells = row.querySelectorAll('td, th');
+        const cells = Array.from(row.querySelectorAll('td, th'));
         if (cells.length < 2) continue;
-        const label = cells[0].innerText?.toLowerCase().trim() || '';
-        const val   = cells[1].innerText?.trim() || '';
-        if (keywords.some(kw => label.includes(kw)) && val) return val;
+
+        // Handle both 2-col and 4-col rows
+        const pairs = [];
+        for (let i = 0; i + 1 < cells.length; i += 2) {
+          const label = cells[i].innerText?.trim().replace(/\s+/g, ' ') || '';
+          const val   = cells[i + 1].innerText?.trim().replace(/\s+/g, ' ') || '';
+          if (label && val && label.length < 80) pairs.push([label, val]);
+        }
+
+        for (const [label, val] of pairs) {
+          const labelLower = label.toLowerCase();
+          if (!val || /^na$/i.test(val)) continue;
+
+          // Store everything in details
+          details[label] = val;
+
+          // Also extract individual fields
+          if (keywords.some(kw => labelLower.includes(kw)) && !estimatedValue)
+            estimatedValue = val;
+          if ((labelLower.includes('tender category') || labelLower.includes('product category')) && !category)
+            category = val;
+          if (labelLower === 'location' && !location)
+            location = val;
+          if (labelLower.includes('emd amount') && !emdAmount)
+            emdAmount = val;
+        }
       }
-      const match = document.body.innerText.match(/(?:Rs\.?|₹)\s*([\d,]+(?:\.\d+)?)/);
-      return match ? match[1] : null;
-    }, VALUE_KEYWORDS);
+
+      // ── Required documents ──
+      const docs = [];
+      const tables = Array.from(document.querySelectorAll('table'));
+      for (const table of tables) {
+        const headers = Array.from(table.querySelectorAll('th')).map(th => th.innerText?.trim().toLowerCase());
+        if (!headers.some(h => h.includes('document name'))) continue;
+        const tableRows = Array.from(table.querySelectorAll('tbody tr'));
+        for (const row of tableRows) {
+          const cells = Array.from(row.querySelectorAll('td'));
+          if (cells.length < 2) continue;
+          const anchor = row.querySelector('a[href]');
+          const name = anchor?.innerText?.trim() || '';
+          if (!name || !/\.(pdf|xls|xlsx|doc|docx|zip)/i.test(name)) continue;
+          const cellTexts = cells.map(c => c.innerText?.trim());
+          const description = cellTexts.find(t => t && t !== name && !/^\d+$/.test(t) && t.length > 1 && !/^s\.?no/i.test(t)) || '';
+          const sizeText = cellTexts.find(t => /^\d+(\.\d+)?$/.test(t)) || '';
+          const href = anchor?.getAttribute('href') || '';
+          docs.push({
+            name,
+            description: description || null,
+            size_kb: sizeText ? parseFloat(sizeText) : null,
+            url: href || null,
+          });
+        }
+      }
+
+      // ── Stable apply/bid URL ──
+      let applyUrl = null;
+      const allLinks = Array.from(document.querySelectorAll('a[href]'));
+      const applyKeywords = ['view more detail', 'apply', 'submit bid', 'bid submission', 'more detail'];
+      for (const a of allLinks) {
+        const text = a.innerText?.toLowerCase().trim() || '';
+        const href = a.getAttribute('href') || '';
+        if (applyKeywords.some(kw => text.includes(kw)) && href && !href.includes('sp=')) {
+          applyUrl = href;
+          break;
+        }
+      }
+      if (!applyUrl) {
+        const cur = window.location.href;
+        if (!cur.includes('sp=')) applyUrl = cur;
+      }
+
+      return { estimatedValue, requiredDocuments: docs, category, location, emdAmount, applyUrl, details };
+    }, keywords);
+
     await detailPage.close();
-    return parseAmount(rawText);
-  } catch {
-    return null;
+    logger.info('[TN] Detail page extracted — value=' + result.estimatedValue + ' category=' + result.category + ' location=' + result.location);
+    return {
+      estimatedValue:    parseAmount(result.estimatedValue),
+      requiredDocuments: result.requiredDocuments,
+      category:          result.category,
+      location:          result.location,
+      emdAmount:         parseAmount(result.emdAmount),
+      applyUrl:          result.applyUrl || null,
+      details:           Object.keys(result.details).length > 0 ? result.details : null,
+    };
+  } catch (err) {
+    logger.warn('[TN] Detail page failed: ' + err.message);
+    return { estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null };
   }
 }
+
+
 
 // ─── Core helpers ─────────────────────────────────────────────────
 
@@ -283,7 +373,7 @@ class TnScraper extends BaseScraper {
             linkIdx++;
 
             // Extract estimated value from detail page
-            const estimatedValue = await extractEstimatedValue(this.page, detailUrl).catch(() => null);
+            const { estimatedValue, requiredDocuments, category, location, emdAmount, applyUrl, details } = await extractDetailPageData(this.page, detailUrl, HOME_URL).catch(() => ({ estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null }));
             if (estimatedValue) logger.info(`[TN] Extracted value ₹${estimatedValue} for "${title.substring(0, 40)}"`);
 
             tenders.push({
@@ -292,7 +382,13 @@ class TnScraper extends BaseScraper {
               organization:    orgClean.substring(0, 200),
               portal:          PORTAL,
               bid_end_date:    parseDate(closing),
-              estimated_value: estimatedValue,
+              estimated_value:       estimatedValue,
+              required_documents:   requiredDocuments.length > 0 ? requiredDocuments : null,
+              category:             category || null,
+              location:             location || null,
+              emd_amount:           emdAmount || null,
+              apply_url:            applyUrl || null,
+              details:              details || null,
               url:             (detailUrl || HOME_URL).substring(0, 1000),
               scraped_at:      new Date().toISOString(),
             });
@@ -336,7 +432,7 @@ class TnScraper extends BaseScraper {
         }
       } catch {}
 
-      const estimatedValue = await extractEstimatedValue(this.page, detailUrl).catch(() => null);
+      const { estimatedValue, requiredDocuments, category, location, emdAmount, applyUrl, details } = await extractDetailPageData(this.page, detailUrl, HOME_URL).catch(() => ({ estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null }));
 
       return {
         tender_id:       makeTenderId(refNo, title),
@@ -344,7 +440,13 @@ class TnScraper extends BaseScraper {
         organization:    orgClean.substring(0, 200),
         portal:          PORTAL,
         bid_end_date:    parseDate(closing),
-        estimated_value: estimatedValue,
+        estimated_value:       estimatedValue,
+              required_documents:   requiredDocuments.length > 0 ? requiredDocuments : null,
+              category:             category || null,
+              location:             location || null,
+              emd_amount:           emdAmount || null,
+              apply_url:            applyUrl || null,
+              details:              details || null,
         url:             (detailUrl || HOME_URL).substring(0, 1000),
         scraped_at:      new Date().toISOString(),
       };
@@ -363,7 +465,7 @@ class TnScraper extends BaseScraper {
       }
     } catch {}
 
-    const estimatedValue = await extractEstimatedValue(this.page, detailUrl).catch(() => null);
+    const { estimatedValue, requiredDocuments, category, location, emdAmount, applyUrl, details } = await extractDetailPageData(this.page, detailUrl, HOME_URL).catch(() => ({ estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null }));
 
     return {
       tender_id:       makeTenderId(refNo, title),
@@ -371,7 +473,13 @@ class TnScraper extends BaseScraper {
       organization:    'Tamil Nadu Government',
       portal:          PORTAL,
       bid_end_date:    parseDate(closingRaw),
-      estimated_value: estimatedValue,
+      estimated_value:       estimatedValue,
+              required_documents:   requiredDocuments.length > 0 ? requiredDocuments : null,
+              category:             category || null,
+              location:             location || null,
+              emd_amount:           emdAmount || null,
+              apply_url:            applyUrl || null,
+              details:              details || null,
       url:             (detailUrl || HOME_URL).substring(0, 1000),
       scraped_at:      new Date().toISOString(),
     };
