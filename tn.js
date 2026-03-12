@@ -23,6 +23,8 @@ const JUNK_PATTERNS = [
   /advanced search/i, /mis reports/i, /search\s*\|/i,
   /eprocurement system/i, /enter captcha/i, /provide captcha/i,
   /no tenders found/i, /tenders\/auctions/i, /search by/i,
+  /closing today/i, /closing within/i, /closing by date/i,
+  /version\s*:/i, /portal policies/i, /contents owned/i,
 ];
 
 const SKIP_TITLES = new Set([
@@ -52,10 +54,8 @@ function isValidTender(title, refNo) {
 
 function parseDate(raw) {
   if (!raw) return null;
-  // "12-Mar-2026 09:00 AM"
   const m1 = raw.match(/(\d{1,2})[-\s\/](\w{3})[-\s\/](\d{4})/);
   if (m1) { const d = new Date(`${m1[1]} ${m1[2]} ${m1[3]}`); if (!isNaN(d.getTime())) return d.toISOString(); }
-  // "12/03/2026"
   const m2 = raw.match(/(\d{1,2})[-\/](\d{2})[-\/](\d{4})/);
   if (m2) { const d = new Date(`${m2[3]}-${m2[2]}-${m2[1]}`); if (!isNaN(d.getTime())) return d.toISOString(); }
   return null;
@@ -68,11 +68,56 @@ function makeTenderId(refNo, title) {
   return `TN-${base}`.substring(0, 200);
 }
 
+// Parse a title cell like "[ Construction of Room ] [A3/2972/2025] [2026_RDTN_1]"
+// Returns { title, refNo }
+function parseTitleCell(raw) {
+  if (!raw) return { title: '', refNo: '' };
+
+  // Extract all bracket contents
+  const brackets = [...raw.matchAll(/\[([^\]]+)\]/g)].map(m => m[1].trim());
+  const beforeFirst = raw.split('[')[0].trim();
+
+  let title = '';
+  let refNo = '';
+
+  if (brackets.length >= 2) {
+    // Format: "[ Title text ] [RefNo] [SystemID]"
+    // OR: "[Title text [RefNo] [SystemID]]" 
+    // First bracket might be the title, second the ref
+    const first = brackets[0];
+    const second = brackets[1];
+
+    if (REF_NO_PATTERN.test(first)) {
+      // First bracket is ref number
+      refNo = first;
+      title = beforeFirst || second;
+    } else if (REF_NO_PATTERN.test(second)) {
+      // Second bracket is ref number, first is title
+      title = cleanTitle(first);
+      refNo = second;
+    } else {
+      title = cleanTitle(first);
+      refNo = second;
+    }
+  } else if (brackets.length === 1) {
+    const content = brackets[0];
+    if (REF_NO_PATTERN.test(content)) {
+      refNo = content;
+      title = cleanTitle(beforeFirst);
+    } else {
+      title = cleanTitle(content);
+    }
+  } else {
+    title = cleanTitle(raw);
+  }
+
+  return { title: cleanTitle(title), refNo };
+}
+
 async function clickTabByText(page, text) {
   const selectors = [
     `a:has-text("${text}")`,
     `td:has-text("${text}")`,
-    `span:has-text("${text}")`,
     `input[value="${text}"]`,
   ];
   for (const sel of selectors) {
@@ -102,13 +147,11 @@ class TnScraper extends BaseScraper {
     try {
       await this.launchBrowser();
 
-      // 1. Load homepage to establish session
       logger.info('[TN] Loading homepage...');
       const ok = await this.navigateTo(HOME_URL);
       if (!ok) throw new Error('Failed to load TN homepage');
       await this.page.waitForTimeout(2000);
 
-      // 2. Click "Tenders by Closing Date" in left nav
       logger.info('[TN] Navigating to Tenders by Closing Date...');
       await this.page.click(SEL.tendersByDate);
       await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
@@ -118,13 +161,6 @@ class TnScraper extends BaseScraper {
       const captchaEl = await this.page.$(SEL.captcha).catch(() => null);
       if (captchaEl) throw new Error('Captcha wall detected');
 
-      // Log all links on page (to confirm tab structure)
-      const allLinks = await this.page.$$eval('a', els =>
-        els.map(e => e.textContent?.trim()).filter(t => t && t.length > 0 && t.length < 80)
-      ).catch(() => []);
-      logger.info(`[TN] Links on page: ${JSON.stringify(allLinks.slice(0, 40))}`);
-
-      // 3. Scrape all 3 date tabs (skip "Closing by Date" — needs date input form)
       const tabs = [
         'Closing within 14 days',
         'Closing within 7 days',
@@ -172,93 +208,86 @@ class TnScraper extends BaseScraper {
 
   async _scrapePage() {
     const tenders = [];
+
+    // The TN portal renders ALL tenders into one giant <tr> with N*6 cells
+    // Strategy: find the row with the most cells that contains "e-Published Date"
+    // and parse it in chunks of 6
     const rows = await this.page.$$(SEL.tableRows).catch(() => []);
 
     for (const row of rows) {
-      try {
-        const t = await this._extractRow(row);
-        if (t) tenders.push(t);
-      } catch (err) {
-        logger.warn(`[TN] Row error: ${err.message}`);
+      const cells = await row.$$('td').catch(() => []);
+      if (cells.length < 12) continue; // Need at least 2 tenders worth of cells
+
+      const getText = async (el) => {
+        try { return (await el.textContent())?.trim().replace(/\s+/g, ' ') ?? ''; }
+        catch { return ''; }
+      };
+
+      const allCells = await Promise.all(cells.map(getText));
+
+      // Find where the header row starts: look for "S.No" followed by "e-Published Date"
+      let dataStart = -1;
+      for (let i = 0; i < allCells.length - 6; i++) {
+        if (/^s\.?no$/i.test(allCells[i]) && /e.published/i.test(allCells[i+1])) {
+          dataStart = i + 6; // skip the 6 header cells
+          break;
+        }
       }
+
+      if (dataStart === -1) continue;
+
+      logger.info(`[TN] Found data row with ${cells.length} cells, data starts at index ${dataStart}`);
+
+      // Parse in chunks of 6: [S.No, e-Published, Bid Closing, Opening, Title+Ref, Org]
+      for (let i = dataStart; i + 5 < allCells.length; i += 6) {
+        const sno       = allCells[i];
+        const published = allCells[i + 1];
+        const closing   = allCells[i + 2];
+        const opening   = allCells[i + 3];
+        const titleCell = allCells[i + 4];
+        const orgChain  = allCells[i + 5];
+
+        // Stop if we hit footer junk
+        if (!sno || !/^\d/.test(sno)) break;
+        if (isJunk(titleCell)) break;
+
+        const { title, refNo } = parseTitleCell(titleCell);
+        const orgParts = orgChain.split('||').map(s => s.trim()).filter(Boolean);
+        const org = orgParts[orgParts.length - 1] || orgParts[0] || 'Tamil Nadu Government';
+
+        if (!isValidTender(title, refNo)) {
+          logger.warn(`[TN] Skipped: title="${title.substring(0,50)}" ref="${refNo}"`);
+          continue;
+        }
+
+        // Get detail URL from the link in the title cell
+        // We need to find the <a> element at position i+4 in the cells array
+        let detailUrl = '';
+        try {
+          const titleEl = cells[i + 4];
+          const a = await titleEl.$('a[href]');
+          if (a) {
+            const href = await a.getAttribute('href');
+            detailUrl = href?.startsWith('http') ? href : `https://tntenders.gov.in${href}`;
+          }
+        } catch {}
+
+        tenders.push({
+          tender_id:    makeTenderId(refNo, title),
+          title:        title.substring(0, 500),
+          organization: org.substring(0, 200),
+          portal:       PORTAL,
+          bid_end_date: parseDate(closing),
+          url:          (detailUrl || HOME_URL).substring(0, 1000),
+          scraped_at:   new Date().toISOString(),
+        });
+      }
+
+      // Only parse the first matching big row per page
+      if (tenders.length > 0) break;
     }
+
     return tenders;
-  }
-
-  async _extractRow(row) {
-    const cells = await row.$$('td');
-    const getText = async (el) => {
-      try { return (await el.textContent())?.trim().replace(/\s+/g, ' ') ?? ''; }
-      catch { return ''; }
-    };
-
-    const allCells = await Promise.all(cells.map(getText));
-
-    // Debug: log first 5 rows with their cell count and content
-    if (cells.length !== 6) {
-      logger.info(`[TN] Row has ${cells.length} cells: ${JSON.stringify(allCells.map(c => c.substring(0, 40)))}`);
-    }
-
-    if (cells.length < 5) return null;
-
-    // From screenshot — 6 columns:
-    // [0] S.No
-    // [1] e-Published Date
-    // [2] Bid Submission Closing Date  ← bid deadline
-    // [3] Tender Opening Date
-    // [4] Title and Ref.No./Tender ID  ← "Title [RefNo] [SystemID]"
-    // [5] Organisation Chain
-
-    const sno       = allCells[0] || '';
-    const closing   = allCells[2] || '';
-    const titleCell = allCells[4] || '';
-    const orgChain  = allCells[5] || 'Tamil Nadu Government';
-
-    // Skip header rows
-    if (/s\.?no/i.test(sno) || /e.published/i.test(allCells[1])) return null;
-
-    // Parse title cell: "Title text [A3/2972/2025] [2026_RDTN_673676_1]"
-    const bracketMatch = titleCell.match(/^([\s\S]*?)\[([^\]]+)\]/);
-    let title = '', refNo = '';
-
-    if (bracketMatch) {
-      title = cleanTitle(bracketMatch[1].trim());
-      refNo = bracketMatch[2].trim();
-    } else {
-      title = cleanTitle(titleCell);
-      refNo = '';
-    }
-
-    // If title is empty but ref is in brackets, check second bracket for system ID and first for ref
-    if (!title && refNo) {
-      title = refNo;
-      refNo = '';
-    }
-
-    // Organisation: last segment after "||" separators
-    const orgParts = orgChain.split('||').map(s => s.trim()).filter(Boolean);
-    const org = orgParts[orgParts.length - 1] || orgParts[0] || 'Tamil Nadu Government';
-
-    if (!isValidTender(title, refNo)) return null;
-
-    let detailUrl = '';
-    try {
-      const a = await row.$('a[href]');
-      if (a) {
-        const href = await a.getAttribute('href');
-        detailUrl = href?.startsWith('http') ? href : `https://tntenders.gov.in${href}`;
-      }
-    } catch {}
-
-    return {
-      tender_id:    makeTenderId(refNo, title),
-      title:        title.substring(0, 500),
-      organization: org.substring(0, 200),
-      portal:       PORTAL,
-      bid_end_date: parseDate(closing),
-      url:          (detailUrl || HOME_URL).substring(0, 1000),
-      scraped_at:   new Date().toISOString(),
-    };
   }
 
   async _goToNextPage() {
