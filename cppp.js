@@ -8,67 +8,42 @@ const BASE_URL = 'https://eprocure.gov.in/eprocure/app?page=FrontEndTendersByOrg
 const PORTAL   = 'cppp';
 
 const SEL = {
-  tableRows:    'table.list_table tbody tr, table tbody tr',
-  nextPage:     '.pagination a[rel="next"], a:has-text("Next >"), a[rel="next"]',
+  tableRows:    'table.list_table tbody tr, tbody tr, table tbody tr',
   captchaImg:   '#captchaImage, img[src*="captcha"]',
-  captchaInput: '#captchaText, input[name="captcha"]',
-  captchaSubmit:'#submitCaptcha, button[type="submit"], input[type="submit"]',
 };
 
-// ── Validation helpers ────────────────────────────────────────────────────────
-
-const JUNK_PATTERNS = [
-  /^function\s/i, /^<[a-z]/i, /window\./i, /document\./i,
-  /javascript/i, /screen\s*reader/i, /visitor\s*no/i,
-  /designed.*developed/i, /national informatics/i,
-  /help for contractors/i, /certifying agency/i,
-  /advanced search/i, /mis reports/i, /online bidder/i,
-  /welcome to eprocurement/i, /updates every 15/i,
-  /search\s*\|/i, /active tenders/i, /portal policies/i,
+// FIX 1: Filter out corrigendum/extension noise — these are not real tenders
+const NOISE_PATTERNS = [
+  /^corrigendum/i,
+  /^amendment/i,
+  /^bid auto ext/i,
+  /date extension/i,
+  /^extension[-\s]/i,
+  /^revised p\.g/i,
+  /^corr$/i,
+  /^nda approval/i,
+  /^bid due date/i,
+  /^pre-tender meet/i,
+  /^invitation to pre-tender/i,
 ];
 
-const SKIP_TITLES = new Set([
-  'tender title', 'reference no', 'closing date', 'bid opening date',
-  'screen reader access', 'certifying agency', 'advanced search',
-  'mis reports', 'help for contractors', 'corrigendum title',
-  'latest tenders', 'latest corrigendum', 'more...', 'visitor no',
-]);
-
-const REF_NO_PATTERN = /[A-Z0-9].{2,}[\/\-].{1,}[A-Z0-9]/i;
-
-function isJunk(text) {
-  if (!text || text.trim().length === 0) return true;
-  if (text.length > 300) return true;
-  for (const pat of JUNK_PATTERNS) {
-    if (pat.test(text)) return true;
-  }
-  return false;
-}
-
-function isValidTender(title, refNo, closingDate) {
-  if (!title || isJunk(title)) return false;
-  if (SKIP_TITLES.has(title.toLowerCase().trim())) return false;
-  const hasRef   = refNo && REF_NO_PATTERN.test(refNo);
-  const hasDate  = !!closingDate && closingDate.match(/\d{1,2}[-\/]\w{3}[-\/]\d{4}/);
-  return !!(hasRef || hasDate);
+function isNoiseTender(title) {
+  if (!title) return true;
+  const t = title.trim();
+  if (t.length < 5) return true;
+  return NOISE_PATTERNS.some(p => p.test(t));
 }
 
 function parseDate(raw) {
   if (!raw) return null;
-  const match = raw.match(/(\d{1,2})[-\s](\w{3})[-\s](\d{4})/);
-  if (!match) return null;
-  const d = new Date(`${match[1]} ${match[2]} ${match[3]}`);
+  const d = new Date(raw.trim().replace(/\s+/g, ' '));
   return isNaN(d.getTime()) ? null : d.toISOString();
 }
 
-function makeTenderId(refNo, title) {
-  const base = (refNo && REF_NO_PATTERN.test(refNo))
-    ? refNo.replace(/\s+/g, '')
-    : title.replace(/\s+/g, '').substring(0, 80);
-  return `CPPP-${base}`.substring(0, 200);
+function makeTenderId(raw) {
+  const token = String(raw).replace(/\s+/g, '').substring(0, 100);
+  return `CPPP-${token}` || null;
 }
-
-// ── Scraper ───────────────────────────────────────────────────────────────────
 
 class CpppScraper extends BaseScraper {
   constructor() { super(PORTAL); }
@@ -91,22 +66,29 @@ class CpppScraper extends BaseScraper {
         try {
           await this.page.waitForSelector(SEL.tableRows, { timeout: 15000, state: 'attached' });
         } catch {
-          logger.warn(`No rows found at page ${pageNum} — stopping`);
+          logger.warn(`No tender rows found at page ${pageNum} — stopping`);
           break;
         }
 
         const tenders = await this._scrapePage();
-        logger.info(`📦 Page ${pageNum} — ${tenders.length} valid tenders`);
+        const valid = tenders.filter(t => !isNoiseTender(t.title));
+        const skipped = tenders.length - valid.length;
 
-        if (tenders.length === 0 && pageNum > 1) break;
+        logger.info(`📦 Page ${pageNum} — ${valid.length} valid tenders (${skipped} noise skipped)`);
 
-        if (tenders.length > 0) {
-          await upsertTenders(tenders);
-          totalScraped += tenders.length;
+        if (valid.length === 0 && tenders.length === 0) break;
+
+        if (valid.length > 0) {
+          await upsertTenders(valid);
+          totalScraped += valid.length;
         }
 
-        const hasNext = await this._goToNextPage();
-        if (!hasNext) break;
+        // FIX 2: CPPP pagination — try multiple strategies
+        const hasNext = await this._goToNextPage(pageNum);
+        if (!hasNext) {
+          logger.info(`📄 No more pages after page ${pageNum}`);
+          break;
+        }
 
         pageNum++;
         await this.randomDelay();
@@ -117,7 +99,7 @@ class CpppScraper extends BaseScraper {
       await logScraperRun({ portal: PORTAL, status: 'success', count: totalScraped });
 
     } catch (err) {
-      logger.error(`💥 CPPP failed: ${err.message}`, { portal: PORTAL });
+      logger.error(`💥 CPPP scraper failed: ${err.message}`);
       await logScraperRun({ portal: PORTAL, status: 'error', count: totalScraped, message: err.message }).catch(() => {});
       process.exit(1);
     } finally {
@@ -129,7 +111,7 @@ class CpppScraper extends BaseScraper {
     try {
       const visible = await this.page.isVisible(SEL.captchaImg, { timeout: 3000 });
       if (!visible) return;
-      logger.warn('🔒 CAPTCHA detected — solving...');
+      logger.warn('🔒 CAPTCHA detected on CPPP — attempting to solve...');
       await this.solveCaptcha(this.page);
     } catch {}
   }
@@ -143,7 +125,7 @@ class CpppScraper extends BaseScraper {
           const t = await this._extractRow(row);
           if (t) tenders.push(t);
         } catch (err) {
-          logger.warn(`Row extract failed: ${err.message}`);
+          logger.warn(`Failed to extract row: ${err.message}`);
         }
       }
     } catch (err) {
@@ -154,22 +136,16 @@ class CpppScraper extends BaseScraper {
 
   async _extractRow(row) {
     const cells = await row.$$('td');
-    if (cells.length < 3) return null;
+    if (cells.length < 2) return null;
 
-    const getText = async (el) => {
-      try { return (await el.textContent())?.trim().replace(/\s+/g, ' ') ?? ''; }
-      catch { return ''; }
-    };
+    const t = async (el) => { try { return (await el.textContent())?.trim() ?? ''; } catch { return ''; } };
 
-    // Strip leading row number like "1. ", "12. " from title
-    const stripRowNum = (s) => s.replace(/^\d+\.\s*/, '').trim();
+    const rawId    = cells[0] ? await t(cells[0]) : '';
+    const rawTitle = cells[1] ? await t(cells[1]) : '';
+    const rawOrg   = cells[2] ? await t(cells[2]) : '';
+    const rawDate  = cells[3] ? await t(cells[3]) : '';
 
-    const rawTitle   = cells[0] ? await getText(cells[0]) : '';
-    const title      = stripRowNum(rawTitle);
-    const refNo      = cells[1] ? await getText(cells[1]) : '';
-    const closingRaw = cells[2] ? await getText(cells[2]) : '';
-
-    if (!isValidTender(title, refNo, closingRaw)) return null;
+    if (!rawTitle && !rawId) return null;
 
     let detailUrl = '';
     try {
@@ -181,26 +157,75 @@ class CpppScraper extends BaseScraper {
     } catch {}
 
     return {
-      tender_id:    makeTenderId(refNo, title),
-      title:        title.substring(0, 500),
-      organization: 'Central Government',
+      tender_id:    makeTenderId(rawId),
+      title:        rawTitle.substring(0, 1000),
+      organization: (rawOrg || 'Central Government').substring(0, 500),
       portal:       PORTAL,
-      bid_end_date: parseDate(closingRaw),
+      bid_end_date: parseDate(rawDate),
       url:          (detailUrl || BASE_URL).substring(0, 1000),
       scraped_at:   new Date().toISOString(),
     };
   }
 
-  async _goToNextPage() {
+  // FIX 2: Multi-strategy pagination for CPPP
+  async _goToNextPage(currentPage) {
     try {
-      const next = await this.page.$(SEL.nextPage);
-      if (!next) return false;
-      const cls = await next.getAttribute('class') ?? '';
-      if (cls.includes('disabled')) return false;
-      await next.click();
-      await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-      return true;
-    } catch { return false; }
+      // Strategy 1: look for exact ">" or "Next" link in pagination
+      const nextEl = await this.page.evaluateHandle(() => {
+        const links = Array.from(document.querySelectorAll('a'));
+        return (
+          links.find(a => a.innerText?.trim() === '>') ||
+          links.find(a => /\bnext\b/i.test(a.innerText?.trim())) ||
+          null
+        );
+      });
+
+      if (nextEl && nextEl.toString() !== 'JSHandle:null') {
+        logger.info(`[CPPP] Clicking next page via link`);
+        await nextEl.click();
+        await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+        await this.page.waitForTimeout(1500);
+        return true;
+      }
+
+      // Strategy 2: look for numbered page link = currentPage + 1
+      const nextPageNum = currentPage + 1;
+      const pageLink = await this.page.$(`a:has-text("${nextPageNum}")`);
+      if (pageLink) {
+        logger.info(`[CPPP] Clicking page number ${nextPageNum}`);
+        await pageLink.click();
+        await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+        await this.page.waitForTimeout(1500);
+        return true;
+      }
+
+      // Strategy 3: check for a form input with page number
+      const pageInput = await this.page.$('input[name="pageNumber"], input[name="page"]');
+      if (pageInput) {
+        logger.info(`[CPPP] Navigating via page input to page ${nextPageNum}`);
+        await pageInput.fill(String(nextPageNum));
+        await pageInput.press('Enter');
+        await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+        await this.page.waitForTimeout(1500);
+        return true;
+      }
+
+      // Strategy 4: log all pagination links for debug
+      const paginationLinks = await this.page.$$eval(
+        'a', els => els
+          .filter(a => a.closest('td, .pagination, .paginationUL, [class*="page"]'))
+          .map(a => ({ text: a.innerText?.trim(), href: a.href }))
+      ).catch(() => []);
+
+      if (paginationLinks.length > 0) {
+        logger.info(`[CPPP] Pagination links found: ${JSON.stringify(paginationLinks.slice(0, 10))}`);
+      }
+
+      return false;
+    } catch (err) {
+      logger.warn(`[CPPP] Pagination error: ${err.message}`);
+      return false;
+    }
   }
 }
 
