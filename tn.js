@@ -10,11 +10,11 @@ const PORTAL   = 'tn';
 const SEL = {
   tendersByDate: 'a:has-text("Tenders by Closing Date")',
   tableRows:     'table tbody tr',
-  nextPage:      'a:has-text("Next"), input[value*="Next"]',
+  nextPage:      'a:has-text("Next"), input[value*="Next"], a:has-text(">")',
   captcha:       '#captchaImage, img[src*="captcha"]',
 };
 
-const REF_NO_PATTERN = /[A-Z0-9].{2,}[\/\-].{1,}[A-Z0-9]/i;
+const REF_NO_PATTERN = /[A-Z0-9][A-Z0-9\/\-\.\s]{1,}[0-9]/i;
 
 const JUNK_PATTERNS = [
   /^function\s/i, /^<[a-z]/i, /window\./i, /document\./i,
@@ -292,14 +292,21 @@ class TnScraper extends BaseScraper {
 
   async _goToNextPage() {
     try {
-      const next = await this.page.$(SEL.nextPage);
-      if (!next) return false;
-      const cls = await next.getAttribute('class') ?? '';
-      if (cls.includes('disabled')) return false;
-      await next.click();
-      await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-      await this.page.waitForTimeout(1000);
-      return true;
+      // TN pagination uses plain <a> links: "2","3",">",">>","<<"
+      // Find the ">" link that is NOT ">>" 
+      const links = await this.page.$$('a').catch(() => []);
+      for (const link of links) {
+        const text = ((await link.textContent()) ?? '').trim();
+        if (text === '>') {
+          const cls = (await link.getAttribute('class') ?? '').toLowerCase();
+          if (cls.includes('disabled') || cls.includes('grey')) return false;
+          await link.click();
+          await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+          await this.page.waitForTimeout(1000);
+          return true;
+        }
+      }
+      return false;
     } catch { return false; }
   }
 }
