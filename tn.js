@@ -12,15 +12,9 @@ const SEL = {
   tableRows:     'table tbody tr',
   nextPage:      'a:has-text("Next"), input[value*="Next"]',
   captcha:       '#captchaImage, img[src*="captcha"]',
-  // Tab links on the Tenders by Date page
-  tabToday:      'input[value="Closing Today"], a:has-text("Closing Today")',
-  tab7days:      'input[value="Closing within 7 days"], a:has-text("Closing within 7 days")',
-  tab14days:     'input[value="Closing within 14 days"], a:has-text("Closing within 14 days")',
-  tabByDate:     'input[value="Closing by Date"], a:has-text("Closing by Date")',
 };
 
 const REF_NO_PATTERN = /[A-Z0-9].{2,}[\/\-].{1,}[A-Z0-9]/i;
-const DATE_PATTERN   = /\d{1,2}[-\/\s](\w{3}|\d{2})[-\/\s]\d{4}/;
 
 const JUNK_PATTERNS = [
   /^function\s/i, /^<[a-z]/i, /window\./i, /document\./i,
@@ -46,7 +40,6 @@ function isJunk(text) {
 }
 
 function cleanTitle(raw) {
-  // Remove wrapping brackets: "[Title text]" -> "Title text"
   return raw.replace(/^\[/, '').replace(/\]$/, '').trim();
 }
 
@@ -59,8 +52,10 @@ function isValidTender(title, refNo) {
 
 function parseDate(raw) {
   if (!raw) return null;
+  // "12-Mar-2026 09:00 AM"
   const m1 = raw.match(/(\d{1,2})[-\s\/](\w{3})[-\s\/](\d{4})/);
   if (m1) { const d = new Date(`${m1[1]} ${m1[2]} ${m1[3]}`); if (!isNaN(d.getTime())) return d.toISOString(); }
+  // "12/03/2026"
   const m2 = raw.match(/(\d{1,2})[-\/](\d{2})[-\/](\d{4})/);
   if (m2) { const d = new Date(`${m2[3]}-${m2[2]}-${m2[1]}`); if (!isNaN(d.getTime())) return d.toISOString(); }
   return null;
@@ -71,6 +66,28 @@ function makeTenderId(refNo, title) {
     ? refNo.replace(/\s+/g, '')
     : title.replace(/\s+/g, '').substring(0, 80);
   return `TN-${base}`.substring(0, 200);
+}
+
+async function clickTabByText(page, text) {
+  const selectors = [
+    `a:has-text("${text}")`,
+    `td:has-text("${text}")`,
+    `span:has-text("${text}")`,
+    `input[value="${text}"]`,
+  ];
+  for (const sel of selectors) {
+    try {
+      const el = await page.$(sel);
+      if (el) {
+        await el.click();
+        await page.waitForTimeout(3000);
+        logger.info(`[TN] Clicked tab "${text}" via: ${sel}`);
+        return true;
+      }
+    } catch {}
+  }
+  logger.warn(`[TN] Tab not found: "${text}"`);
+  return false;
 }
 
 class TnScraper extends BaseScraper {
@@ -85,55 +102,38 @@ class TnScraper extends BaseScraper {
     try {
       await this.launchBrowser();
 
-      // Navigate to homepage first to establish session
+      // 1. Load homepage to establish session
       logger.info('[TN] Loading homepage...');
       const ok = await this.navigateTo(HOME_URL);
       if (!ok) throw new Error('Failed to load TN homepage');
       await this.page.waitForTimeout(2000);
 
-      // Click "Tenders by Closing Date" to get to the tab page
+      // 2. Click "Tenders by Closing Date" in left nav
       logger.info('[TN] Navigating to Tenders by Closing Date...');
       await this.page.click(SEL.tendersByDate);
       await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-      await this.page.waitForTimeout(2000);
+      await this.page.waitForTimeout(3000);
       logger.info(`[TN] URL: ${this.page.url()}`);
 
-      // Check for captcha
       const captchaEl = await this.page.$(SEL.captcha).catch(() => null);
-      if (captchaEl) throw new Error('Captcha wall on Tenders by Closing Date page');
+      if (captchaEl) throw new Error('Captcha wall detected');
 
-      // Log what tabs are visible
-      const tabTexts = await this.page.$$eval('input[type="button"], input[type="submit"]', 
-        els => els.map(e => e.value)).catch(() => []);
-      logger.info(`[TN] Tab buttons found: ${JSON.stringify(tabTexts)}`);
+      // Log all links on page (to confirm tab structure)
+      const allLinks = await this.page.$$eval('a', els =>
+        els.map(e => e.textContent?.trim()).filter(t => t && t.length > 0 && t.length < 80)
+      ).catch(() => []);
+      logger.info(`[TN] Links on page: ${JSON.stringify(allLinks.slice(0, 40))}`);
 
-      // Scrape each tab by clicking and waiting for table refresh
+      // 3. Scrape all 3 date tabs (skip "Closing by Date" — needs date input form)
       const tabs = [
-        { label: 'Closing within 14 days', selector: SEL.tab14days },
-        { label: 'Closing within 7 days',  selector: SEL.tab7days },
-        { label: 'Closing Today',          selector: SEL.tabToday },
+        'Closing within 14 days',
+        'Closing within 7 days',
+        'Closing Today',
       ];
 
-      for (const { label, selector } of tabs) {
-        logger.info(`[TN] Clicking tab: ${label}`);
-        try {
-          const tabEl = await this.page.$(selector);
-          if (!tabEl) {
-            logger.warn(`[TN] Tab not found: ${label}`);
-            continue;
-          }
-          await tabEl.click();
-          await this.page.waitForTimeout(3000); // wait for table to reload
-          await this.page.waitForSelector(SEL.tableRows, { timeout: 10000 });
-        } catch (err) {
-          logger.warn(`[TN] Tab click failed "${label}": ${err.message}`);
-          continue;
-        }
-
-        // Log first row to verify tab switched
-        const sample = await this.page.$eval('table tbody tr:first-child', 
-          el => el.innerText?.substring(0, 150)).catch(() => '');
-        logger.info(`[TN] ${label} sample row: ${sample}`);
+      for (const tabText of tabs) {
+        const clicked = await clickTabByText(this.page, tabText);
+        if (!clicked) continue;
 
         let pageNum = 1;
         while (true) {
@@ -141,14 +141,14 @@ class TnScraper extends BaseScraper {
           const newTenders = tenders.filter(t => !seenIds.has(t.tender_id));
           newTenders.forEach(t => seenIds.add(t.tender_id));
 
-          logger.info(`[TN] ${label} page ${pageNum} — ${tenders.length} found, ${newTenders.length} new`);
+          logger.info(`[TN] "${tabText}" page ${pageNum} — ${tenders.length} found, ${newTenders.length} new`);
 
           if (newTenders.length > 0) {
             await upsertTenders(newTenders);
             totalScraped += newTenders.length;
           }
 
-          if (tenders.length === 0 && pageNum > 1) break;
+          if (tenders.length === 0) break;
 
           const hasNext = await this._goToNextPage();
           if (!hasNext) break;
@@ -187,7 +187,7 @@ class TnScraper extends BaseScraper {
 
   async _extractRow(row) {
     const cells = await row.$$('td');
-    if (cells.length < 2) return null;
+    if (cells.length < 5) return null;
 
     const getText = async (el) => {
       try { return (await el.textContent())?.trim().replace(/\s+/g, ' ') ?? ''; }
@@ -196,49 +196,43 @@ class TnScraper extends BaseScraper {
 
     const allCells = await Promise.all(cells.map(getText));
 
-    // "Tenders by Date" 6-column layout:
-    // [0] S.No | [1] e-Published | [2] Bid Closing | [3] Opening | [4] Title+RefNo+ID | [5] Organisation
-    if (allCells.length >= 5) {
-      const titleCell = allCells[4] || '';
-      const org       = allCells[5] || 'Tamil Nadu Government';
-      const closing   = allCells[2] || '';
+    // From screenshot — 6 columns:
+    // [0] S.No
+    // [1] e-Published Date
+    // [2] Bid Submission Closing Date  ← bid deadline
+    // [3] Tender Opening Date
+    // [4] Title and Ref.No./Tender ID  ← "Title [RefNo] [SystemID]"
+    // [5] Organisation Chain
 
-      // Title cell format: "Title text [RefNo/2026] [2026_XXXX_1]"
-      // Extract title (before first bracket) and refNo (inside first bracket)
-      const beforeBracket = titleCell.split('[')[0].trim();
-      const bracketContents = [...titleCell.matchAll(/\[([^\]]+)\]/g)].map(m => m[1]);
+    const sno       = allCells[0] || '';
+    const closing   = allCells[2] || '';
+    const titleCell = allCells[4] || '';
+    const orgChain  = allCells[5] || 'Tamil Nadu Government';
 
-      const title = cleanTitle(beforeBracket || titleCell);
-      // First bracket is usually the ref number, second is the tender system ID
-      const refNo = bracketContents[0] || '';
-      const orgClean = org.split('||')[0].trim().substring(0, 200);
+    // Skip header rows
+    if (/s\.?no/i.test(sno) || /e.published/i.test(allCells[1])) return null;
 
-      if (!isValidTender(title, refNo)) return null;
+    // Parse title cell: "Title text [A3/2972/2025] [2026_RDTN_673676_1]"
+    const bracketMatch = titleCell.match(/^([\s\S]*?)\[([^\]]+)\]/);
+    let title = '', refNo = '';
 
-      let detailUrl = '';
-      try {
-        const a = await row.$('a[href]');
-        if (a) {
-          const href = await a.getAttribute('href');
-          detailUrl = href?.startsWith('http') ? href : `https://tntenders.gov.in${href}`;
-        }
-      } catch {}
-
-      return {
-        tender_id:    makeTenderId(refNo, title),
-        title:        title.substring(0, 500),
-        organization: orgClean,
-        portal:       PORTAL,
-        bid_end_date: parseDate(closing),
-        url:          (detailUrl || HOME_URL).substring(0, 1000),
-        scraped_at:   new Date().toISOString(),
-      };
+    if (bracketMatch) {
+      title = cleanTitle(bracketMatch[1].trim());
+      refNo = bracketMatch[2].trim();
+    } else {
+      title = cleanTitle(titleCell);
+      refNo = '';
     }
 
-    // Fallback: 4-column layout
-    const title      = cleanTitle(allCells[0].replace(/^\d+\.\s*/, '').trim());
-    const refNo      = allCells[1] || '';
-    const closingRaw = allCells[2] || '';
+    // If title is empty but ref is in brackets, check second bracket for system ID and first for ref
+    if (!title && refNo) {
+      title = refNo;
+      refNo = '';
+    }
+
+    // Organisation: last segment after "||" separators
+    const orgParts = orgChain.split('||').map(s => s.trim()).filter(Boolean);
+    const org = orgParts[orgParts.length - 1] || orgParts[0] || 'Tamil Nadu Government';
 
     if (!isValidTender(title, refNo)) return null;
 
@@ -254,9 +248,9 @@ class TnScraper extends BaseScraper {
     return {
       tender_id:    makeTenderId(refNo, title),
       title:        title.substring(0, 500),
-      organization: 'Tamil Nadu Government',
+      organization: org.substring(0, 200),
       portal:       PORTAL,
-      bid_end_date: parseDate(closingRaw),
+      bid_end_date: parseDate(closing),
       url:          (detailUrl || HOME_URL).substring(0, 1000),
       scraped_at:   new Date().toISOString(),
     };
@@ -270,6 +264,7 @@ class TnScraper extends BaseScraper {
       if (cls.includes('disabled')) return false;
       await next.click();
       await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+      await this.page.waitForTimeout(1000);
       return true;
     } catch { return false; }
   }
