@@ -59,6 +59,8 @@ function parseAmount(text) {
 
 async function extractDetailPageData(page, url, baseUrl) {
   if (!url || url === baseUrl) return { estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null };
+  if (!url.includes('DirectLink')) return { estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null };
+  if (url.includes('gepnicreports')) return { estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null };
   try {
     logger.info('[TN] Visiting detail page: ' + url.substring(0, 80));
     const detailPage = await page.context().newPage();
@@ -149,7 +151,7 @@ async function extractDetailPageData(page, url, baseUrl) {
       }
 
       return { estimatedValue, requiredDocuments: docs, category, location, emdAmount, applyUrl, details };
-    }, keywords);
+    }, VALUE_KEYWORDS);
 
     await detailPage.close();
     logger.info('[TN] Detail page extracted — value=' + result.estimatedValue + ' category=' + result.category + ' location=' + result.location);
@@ -341,7 +343,8 @@ class TnScraper extends BaseScraper {
           logger.info(`[TN] Found data row with ${allCells.length} cells, data starts at index ${dataStart}`);
 
           const anchorHrefs = await row.$$eval('a[href]', els =>
-            els.map(a => a.getAttribute('href')).filter(Boolean)
+            els.map(a => a.getAttribute('href'))
+              .filter(h => h && h.includes('DirectLink'))
           ).catch(() => []);
 
           let linkIdx = 0;
