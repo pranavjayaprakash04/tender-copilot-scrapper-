@@ -16,7 +16,6 @@ const SEL = {
   tab14days:     'a:has-text("Closing within 14 days")',
 };
 
-// FIX 1: Relaxed pattern — allows spaces and dots (handles "B1/2025 Dated 6.3.2026")
 const REF_NO_PATTERN = /[A-Z0-9][A-Z0-9\/\-\.\s]{1,}[0-9]/i;
 
 const JUNK_PATTERNS = [
@@ -36,6 +35,53 @@ const SKIP_TITLES = new Set([
   'tenders/auctions closing today', 'search by',
 ]);
 
+// ─── Estimated value helpers ─────────────────────────────────────
+
+const VALUE_KEYWORDS = [
+  'estimated value', 'estimated cost', 'tender value',
+  'contract value', 'approximate value', 'tender amount',
+  'work value', 'nit value',
+];
+
+function parseAmount(text) {
+  if (!text) return null;
+  text = text.replace(/Rs\.?/gi, '').replace(/₹/g, '').replace(/\/-/g, '').trim();
+  const crore = text.match(/([\d,.]+)\s*(?:crore|crores|cr\.?)\b/i);
+  if (crore) return parseFloat(crore[1].replace(/,/g, '')) * 10_000_000;
+  const lakh = text.match(/([\d,.]+)\s*(?:lakh|lakhs|lac|lacs)\b/i);
+  if (lakh) return parseFloat(lakh[1].replace(/,/g, '')) * 100_000;
+  const plain = text.replace(/,/g, '').match(/[\d.]+/);
+  if (plain) { const v = parseFloat(plain[0]); return isNaN(v) ? null : v; }
+  return null;
+}
+
+async function extractEstimatedValue(page, url) {
+  if (!url || url === HOME_URL) return null;
+  try {
+    const detailPage = await page.context().newPage();
+    await detailPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await detailPage.waitForTimeout(800);
+    const rawText = await detailPage.evaluate((keywords) => {
+      const rows = Array.from(document.querySelectorAll('tr'));
+      for (const row of rows) {
+        const cells = row.querySelectorAll('td, th');
+        if (cells.length < 2) continue;
+        const label = cells[0].innerText?.toLowerCase().trim() || '';
+        const val   = cells[1].innerText?.trim() || '';
+        if (keywords.some(kw => label.includes(kw)) && val) return val;
+      }
+      const match = document.body.innerText.match(/(?:Rs\.?|₹)\s*([\d,]+(?:\.\d+)?)/);
+      return match ? match[1] : null;
+    }, VALUE_KEYWORDS);
+    await detailPage.close();
+    return parseAmount(rawText);
+  } catch {
+    return null;
+  }
+}
+
+// ─── Core helpers ─────────────────────────────────────────────────
+
 function isJunk(text) {
   if (!text || text.trim().length === 0) return true;
   if (text.length > 500) return true;
@@ -50,6 +96,8 @@ function isValidTender(title, refNo) {
   if (!title || isJunk(title)) return false;
   if (SKIP_TITLES.has(title.toLowerCase().trim())) return false;
   if (title.length < 10) return false;
+  // Filter system IDs like 2026_DMRH_668573_1
+  if (/^\d{4}_[A-Za-z]+_\d+_\d+$/.test(title)) return false;
   return !!(refNo && REF_NO_PATTERN.test(refNo));
 }
 
@@ -69,35 +117,25 @@ function makeTenderId(refNo, title) {
   return `TN-${base}`.substring(0, 200);
 }
 
-// FIX 2: Smart title/ref swap detection
-// If first bracket is short (<40 chars) → it's the ref; long text → it's the title
 function parseTitleCell(titleCell) {
   const bracketContents = [...titleCell.matchAll(/\[([^\]]+)\]/g)].map(m => m[1]);
   const beforeBracket   = titleCell.split('[')[0].trim();
-
-  let title = '';
-  let refNo = '';
+  let title = '', refNo = '';
 
   if (bracketContents.length === 0) {
-    title = cleanTitle(titleCell);
-    refNo = '';
+    title = cleanTitle(titleCell); refNo = '';
   } else if (bracketContents.length === 1) {
-    // Only one bracket — decide if it's ref or title
     if (bracketContents[0].length < 40 && REF_NO_PATTERN.test(bracketContents[0])) {
       refNo = bracketContents[0];
       title = cleanTitle(beforeBracket || bracketContents[0]);
     } else {
-      title = cleanTitle(bracketContents[0]);
-      refNo = '';
+      title = cleanTitle(bracketContents[0]); refNo = '';
     }
   } else {
-    // Multiple brackets — short one is ref, long one is title
     const shortBracket = bracketContents.find(b => b.length < 40 && REF_NO_PATTERN.test(b));
     const longBracket  = bracketContents.find(b => b.length >= 15);
-
     if (shortBracket && longBracket && shortBracket !== longBracket) {
-      refNo = shortBracket;
-      title = cleanTitle(longBracket);
+      refNo = shortBracket; title = cleanTitle(longBracket);
     } else if (shortBracket) {
       refNo = shortBracket;
       title = cleanTitle(beforeBracket || longBracket || bracketContents[0]);
@@ -106,10 +144,7 @@ function parseTitleCell(titleCell) {
       refNo = bracketContents[0];
     }
   }
-
-  // Final fallback: title from beforeBracket text if still empty
   if (!title && beforeBracket.length > 5) title = cleanTitle(beforeBracket);
-
   return { title, refNo };
 }
 
@@ -139,10 +174,6 @@ class TnScraper extends BaseScraper {
       const captchaEl = await this.page.$(SEL.captcha).catch(() => null);
       if (captchaEl) throw new Error('Captcha wall on Tenders by Closing Date page');
 
-      // Log visible links for debug
-      const links = await this.page.$$eval('a', els => els.map(e => e.innerText?.trim()).filter(Boolean)).catch(() => []);
-      logger.info(`[TN] Links on page: ${JSON.stringify(links.slice(0, 40))}`);
-
       const tabs = [
         { label: 'Closing within 14 days', selector: SEL.tab14days },
         { label: 'Closing within 7 days',  selector: SEL.tab7days },
@@ -153,10 +184,9 @@ class TnScraper extends BaseScraper {
         try {
           const tabEl = await this.page.$(selector);
           if (!tabEl) { logger.warn(`[TN] Tab not found: ${label}`); continue; }
-
           await tabEl.click();
           await this.page.waitForTimeout(3000);
-          logger.info(`[TN] Clicked tab "${label}" via: ${selector}`);
+          logger.info(`[TN] Clicked tab "${label}"`);
         } catch (err) {
           logger.warn(`[TN] Tab click failed "${label}": ${err.message}`);
           continue;
@@ -176,7 +206,6 @@ class TnScraper extends BaseScraper {
           }
 
           if (tenders.length === 0 && pageNum > 1) break;
-
           const hasNext = await this._goToNextPage();
           if (!hasNext) break;
           pageNum++;
@@ -197,7 +226,6 @@ class TnScraper extends BaseScraper {
     }
   }
 
-  // FIX 3: Giant row parser — TN dumps all tenders in one huge <tr> with N×6 cells
   async _scrapePage() {
     const tenders = [];
     const rows = await this.page.$$(SEL.tableRows).catch(() => []);
@@ -206,55 +234,38 @@ class TnScraper extends BaseScraper {
       try {
         const cells = await row.$$('td');
 
-        // FIX 3a: Detect the giant data row (12+ cells containing header keywords)
         if (cells.length >= 12) {
           const getText = async (el) => {
             try { return (await el.textContent())?.trim().replace(/\s+/g, ' ') ?? ''; }
             catch { return ''; }
           };
-
           const allCells = await Promise.all(cells.map(getText));
 
-          // Find where the header row starts (look for "S.No" or "e-Published")
           let dataStart = -1;
           for (let i = 0; i < allCells.length - 5; i++) {
             const v = allCells[i].toLowerCase();
-            if (v === 's.no' || v === 'sno' || v === 'sl.no') {
-              dataStart = i + 6; // skip 6 header cells
-              break;
-            }
+            if (v === 's.no' || v === 'sno' || v === 'sl.no') { dataStart = i + 6; break; }
           }
-
-          if (dataStart === -1) {
-            // No header found — try parsing from start in chunks of 6
-            dataStart = 0;
-          }
+          if (dataStart === -1) dataStart = 0;
 
           logger.info(`[TN] Found data row with ${allCells.length} cells, data starts at index ${dataStart}`);
 
-          // Collect <a href> links from title cells (every 5th cell after dataStart)
           const anchorHrefs = await row.$$eval('a[href]', els =>
             els.map(a => a.getAttribute('href')).filter(Boolean)
           ).catch(() => []);
 
           let linkIdx = 0;
           for (let i = dataStart; i + 5 < allCells.length; i += 6) {
-            const sno     = allCells[i];
-            const pub     = allCells[i + 1];
-            const closing = allCells[i + 2];
-            const opening = allCells[i + 3];
+            const sno       = allCells[i];
+            const closing   = allCells[i + 2];
             const titleCell = allCells[i + 4];
-            const org     = allCells[i + 5];
+            const org       = allCells[i + 5];
 
-            // Stop on non-numeric S.No (footer junk)
             if (sno && !/^\d+\.?$/.test(sno.trim())) break;
 
             const { title, refNo } = parseTitleCell(titleCell);
             const orgClean = (org || 'Tamil Nadu Government')
-              .split('||')
-              .map(s => s.trim())
-              .filter(Boolean)
-              .pop() || 'Tamil Nadu Government';
+              .split('||').map(s => s.trim()).filter(Boolean).pop() || 'Tamil Nadu Government';
 
             if (!isValidTender(title, refNo)) {
               logger.warn(`[TN] Skipped: title="${title?.substring(0, 50)}" ref="${refNo?.substring(0, 50)}"`);
@@ -262,7 +273,6 @@ class TnScraper extends BaseScraper {
               continue;
             }
 
-            // FIX 4: Get detail URL from anchor list
             let detailUrl = '';
             const rawHref = anchorHrefs[linkIdx] || '';
             if (rawHref) {
@@ -272,21 +282,24 @@ class TnScraper extends BaseScraper {
             }
             linkIdx++;
 
+            // Extract estimated value from detail page
+            const estimatedValue = await extractEstimatedValue(this.page, detailUrl).catch(() => null);
+            if (estimatedValue) logger.info(`[TN] Extracted value ₹${estimatedValue} for "${title.substring(0, 40)}"`);
+
             tenders.push({
-              tender_id:    makeTenderId(refNo, title),
-              title:        title.substring(0, 500),
-              organization: orgClean.substring(0, 200),
-              portal:       PORTAL,
-              bid_end_date: parseDate(closing),
-              url:          (detailUrl || HOME_URL).substring(0, 1000),
-              scraped_at:   new Date().toISOString(),
+              tender_id:       makeTenderId(refNo, title),
+              title:           title.substring(0, 500),
+              organization:    orgClean.substring(0, 200),
+              portal:          PORTAL,
+              bid_end_date:    parseDate(closing),
+              estimated_value: estimatedValue,
+              url:             (detailUrl || HOME_URL).substring(0, 1000),
+              scraped_at:      new Date().toISOString(),
             });
           }
-
-          continue; // skip the regular row extractor for this giant row
+          continue;
         }
 
-        // Normal row (< 12 cells) — original logic
         const t = await this._extractRow(row);
         if (t) tenders.push(t);
 
@@ -305,7 +318,6 @@ class TnScraper extends BaseScraper {
       try { return (await el.textContent())?.trim().replace(/\s+/g, ' ') ?? ''; }
       catch { return ''; }
     };
-
     const allCells = await Promise.all(cells.map(getText));
 
     if (allCells.length >= 5) {
@@ -313,7 +325,6 @@ class TnScraper extends BaseScraper {
       const org     = allCells[5] || 'Tamil Nadu Government';
       const closing = allCells[2] || '';
       const orgClean = org.split('||').map(s => s.trim()).filter(Boolean).pop() || 'Tamil Nadu Government';
-
       if (!isValidTender(title, refNo)) return null;
 
       let detailUrl = '';
@@ -325,18 +336,20 @@ class TnScraper extends BaseScraper {
         }
       } catch {}
 
+      const estimatedValue = await extractEstimatedValue(this.page, detailUrl).catch(() => null);
+
       return {
-        tender_id:    makeTenderId(refNo, title),
-        title:        title.substring(0, 500),
-        organization: orgClean.substring(0, 200),
-        portal:       PORTAL,
-        bid_end_date: parseDate(closing),
-        url:          (detailUrl || HOME_URL).substring(0, 1000),
-        scraped_at:   new Date().toISOString(),
+        tender_id:       makeTenderId(refNo, title),
+        title:           title.substring(0, 500),
+        organization:    orgClean.substring(0, 200),
+        portal:          PORTAL,
+        bid_end_date:    parseDate(closing),
+        estimated_value: estimatedValue,
+        url:             (detailUrl || HOME_URL).substring(0, 1000),
+        scraped_at:      new Date().toISOString(),
       };
     }
 
-    // Fallback: 4-column
     const { title, refNo } = parseTitleCell(allCells[0].replace(/^\d+\.\s*/, '').trim());
     const closingRaw = allCells[2] || '';
     if (!isValidTender(title, refNo)) return null;
@@ -350,32 +363,33 @@ class TnScraper extends BaseScraper {
       }
     } catch {}
 
+    const estimatedValue = await extractEstimatedValue(this.page, detailUrl).catch(() => null);
+
     return {
-      tender_id:    makeTenderId(refNo, title),
-      title:        title.substring(0, 500),
-      organization: 'Tamil Nadu Government',
-      portal:       PORTAL,
-      bid_end_date: parseDate(closingRaw),
-      url:          (detailUrl || HOME_URL).substring(0, 1000),
-      scraped_at:   new Date().toISOString(),
+      tender_id:       makeTenderId(refNo, title),
+      title:           title.substring(0, 500),
+      organization:    'Tamil Nadu Government',
+      portal:          PORTAL,
+      bid_end_date:    parseDate(closingRaw),
+      estimated_value: estimatedValue,
+      url:             (detailUrl || HOME_URL).substring(0, 1000),
+      scraped_at:      new Date().toISOString(),
     };
   }
 
-  // FIX 5: TN pagination uses single ">" character, not "Next" text
   async _goToNextPage() {
     try {
-      // Find all pagination links and look for the exact single ">" character
-      const nextEl = await this.page.evaluateHandle(() => {
-        const links = Array.from(document.querySelectorAll('a'));
-        return links.find(a => a.innerText?.trim() === '>') || null;
-      });
-
-      if (!nextEl || nextEl.toString() === 'JSHandle:null') return false;
-
-      await nextEl.click();
-      await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-      await this.page.waitForTimeout(1500);
-      return true;
+      const allLinks = await this.page.$$('a');
+      for (const link of allLinks) {
+        const text = (await link.textContent().catch(() => '')).trim();
+        if (text === '>') {
+          await link.click();
+          await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+          await this.page.waitForTimeout(1500);
+          return true;
+        }
+      }
+      return false;
     } catch { return false; }
   }
 }
