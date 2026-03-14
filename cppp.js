@@ -260,6 +260,7 @@ class CpppScraper extends BaseScraper {
       const ok = await this.navigateTo(BASE_URL);
       if (!ok) throw new Error('Failed to load CPPP page');
       logger.info(`[CPPP] URL: ${this.page.url()}`);
+      const enrichedIds = await fetchEnrichedIds();
 
       const tabs = [
         { label: 'Closing within 14 days', selector: SEL.tab14days },
