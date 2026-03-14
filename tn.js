@@ -294,6 +294,8 @@ class TnScraper extends BaseScraper {
       const captchaEl = await this.page.$(SEL.captcha).catch(() => null);
       if (captchaEl) throw new Error('Captcha wall on Tenders by Closing Date page');
 
+      const enrichedIds = await fetchEnrichedIds();
+
       const tabs = [
         { label: 'Closing within 14 days', selector: SEL.tab14days },
         { label: 'Closing within 7 days',  selector: SEL.tab7days },
