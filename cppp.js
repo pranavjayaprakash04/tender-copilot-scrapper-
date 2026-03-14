@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 const BaseScraper                      = require('./base');
-const { upsertTenders, logScraperRun } = require('./supabase');
+const { upsertTenders, logScraperRun, supabase } = require('./supabase');
 const logger                           = require('./logger');
 
 const BASE_URL = 'https://eprocure.gov.in/eprocure/app?page=FrontEndListTendersbyDate&service=page';
@@ -47,6 +47,7 @@ const VALUE_KEYWORDS = [
 function parseAmount(text) {
   if (!text) return null;
   if (/^na$/i.test(text.trim())) return null;
+  if (/^0(\.0+)?$/.test(text.trim())) return null;
   text = text.replace(/Rs\.?/gi, '').replace(/₹/g, '').replace(/\/-/g, '').trim();
   const crore = text.match(/([\d,.]+)\s*(?:crore|crores|cr\.?)\b/i);
   if (crore) return parseFloat(crore[1].replace(/,/g, '')) * 10_000_000;
@@ -55,6 +56,33 @@ function parseAmount(text) {
   const plain = text.replace(/,/g, '').match(/[\d.]+/);
   if (plain) { const v = parseFloat(plain[0]); return isNaN(v) ? null : v; }
   return null;
+}
+
+
+// ─── Fetch tender IDs already enriched in DB ─────────────────────
+async function fetchEnrichedIds() {
+  try {
+    const enriched = new Set();
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+      const { data, error } = await supabase
+        .from('tenders')
+        .select('tender_id')
+        .eq('portal', 'cppp')
+        .not('details', 'is', null)
+        .range(from, from + pageSize - 1);
+      if (error || !data || data.length === 0) break;
+      data.forEach(r => enriched.add(r.tender_id));
+      if (data.length < pageSize) break;
+      from += pageSize;
+    }
+    logger.info('[CPPP] Skipping detail pages for ' + enriched.size + ' already-enriched tenders');
+    return enriched;
+  } catch (err) {
+    logger.warn('[CPPP] Could not fetch enriched IDs: ' + err.message);
+    return new Set();
+  }
 }
 
 async function extractDetailPageData(page, url, baseUrl) {
@@ -253,7 +281,7 @@ class CpppScraper extends BaseScraper {
 
         let pageNum = 1;
         while (true) {
-          const tenders = await this._scrapePage();
+          const tenders = await this._scrapePage(enrichedIds);
           const newTenders = tenders.filter(t => !seenIds.has(t.tender_id) && !isNoise(t.title));
           newTenders.forEach(t => seenIds.add(t.tender_id));
 
@@ -285,7 +313,7 @@ class CpppScraper extends BaseScraper {
     }
   }
 
-  async _scrapePage() {
+  async _scrapePage(enrichedIds = new Set()) {
     const tenders = [];
     const rows = await this.page.$$(SEL.tableRows).catch(() => []);
 
@@ -336,6 +364,13 @@ class CpppScraper extends BaseScraper {
             }
             linkIdx++;
 
+            // Skip detail page if already enriched
+            const tenderId = makeTenderId(refNo, title);
+            if (enrichedIds.has(tenderId)) {
+              tenders.push({ tender_id: tenderId, title: title.substring(0, 500), organization: orgClean.substring(0, 200), portal: PORTAL, bid_end_date: parseDate(closing), url: (detailUrl || BASE_URL).substring(0, 1000), scraped_at: new Date().toISOString() });
+              linkIdx++;
+              continue;
+            }
             const { estimatedValue, requiredDocuments, category, location, emdAmount, applyUrl, details } = await extractDetailPageData(this.page, detailUrl, BASE_URL).catch(() => ({ estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null }));
             if (estimatedValue) logger.info(`[CPPP] Extracted value ₹${estimatedValue} for "${title.substring(0, 40)}"`);
 
