@@ -2,10 +2,7 @@ name: TenderPilot Autonomous Scraper
 
 on:
   schedule:
-    # Runs every 2 hours, 24/7
     - cron: '0 */2 * * *'
-  
-  # Also allows manual trigger from GitHub UI
   workflow_dispatch:
     inputs:
       portal:
@@ -22,70 +19,60 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # 2 hour max per run
+    timeout-minutes: 120
 
     strategy:
       fail-fast: false
-      # Run all 3 portals IN PARALLEL as separate jobs
       matrix:
         portal: [gem, cppp, tn]
 
     name: Scrape ${{ matrix.portal }}
 
     steps:
-      # ── Skip if manual run with specific portal ──────────────────────────
       - name: Check if portal should run
         id: check
         run: |
           SELECTED="${{ github.event.inputs.portal || 'all' }}"
           PORTAL="${{ matrix.portal }}"
           if [ "$SELECTED" = "all" ] || [ "$SELECTED" = "$PORTAL" ]; then
-            echo "run=true" >> $GITHUB_OUTPUT
+            echo "run=true" >> "$GITHUB_OUTPUT"
           else
-            echo "run=false" >> $GITHUB_OUTPUT
+            echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # ── Checkout code ────────────────────────────────────────────────────
-      - name: Checkout repository
+      - name: Checkout code
         if: steps.check.outputs.run == 'true'
         uses: actions/checkout@v4
 
-      # ── Setup Node.js ────────────────────────────────────────────────────
-      - name: Setup Node.js
+      - name: Set up Node.js
         if: steps.check.outputs.run == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
-      # ── Setup Python for ddddocr ─────────────────────────────────────────
-      - name: Setup Python
+      - name: Set up Python
         if: steps.check.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # ── Install Python CAPTCHA solver ────────────────────────────────────
-      - name: Install ddddocr
+      - name: Install CAPTCHA solver
         if: steps.check.outputs.run == 'true'
         run: pip install ddddocr
 
-      # ── Install Node dependencies ────────────────────────────────────────
       - name: Install Node dependencies
         if: steps.check.outputs.run == 'true'
         run: npm install
 
-      # ── Install Playwright + Chromium ────────────────────────────────────
       - name: Install Playwright Chromium
         if: steps.check.outputs.run == 'true'
         run: npx playwright install chromium --with-deps
 
-      # ── Create logs directory ────────────────────────────────────────────
       - name: Create logs directory
         if: steps.check.outputs.run == 'true'
         run: mkdir -p logs
 
-      # ── Run the scraper ──────────────────────────────────────────────────
-      - name: Run ${{ matrix.portal }} scraper
+      - name: Run scraper
         if: steps.check.outputs.run == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -95,7 +82,6 @@ jobs:
           REQUEST_DELAY_MAX: 5000
         run: node ${{ matrix.portal }}.js
 
-      # ── Upload logs as artifact (viewable in GitHub UI) ──────────────────
       - name: Upload scraper logs
         if: always() && steps.check.outputs.run == 'true'
         uses: actions/upload-artifact@v4
@@ -103,3 +89,4 @@ jobs:
           name: logs-${{ matrix.portal }}-${{ github.run_number }}
           path: logs/
           retention-days: 7
+          
