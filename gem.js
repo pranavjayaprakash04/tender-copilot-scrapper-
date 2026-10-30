@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 const BaseScraper = require('./base');
-const { upsertTenders, logScraperRun } = require('./supabase');
+const { upsertTenders, logScraperRun, supabase } = require('./supabase');
 const logger = require('./logger');
 
 const PORTAL = 'gem';
@@ -59,6 +59,7 @@ class GemScraper extends BaseScraper {
         throw new Error(`Failed to load GeM bid listing after ${NAVIGATION_RETRIES} attempts${reason ? `; last error: ${reason}` : ''}`);
       }
       await this.page.waitForSelector(CARD_SELECTOR, { timeout: 20000 });
+      const existingApplyUrls = await this._fetchExistingApplyUrls();
 
       const totalText = await this.page.textContent('#bidCard .totalRecord').catch(() => '');
       const totalMatch = totalText?.match(/of\s+([\d,]+)\s+records/i);
@@ -71,7 +72,7 @@ class GemScraper extends BaseScraper {
       logger.info(`[GeM] Listing reports ${totalRecords ?? 'an unknown number of'} bids; reading up to ${pagesToRead} pages`);
 
       for (let pageNumber = 1; pageNumber <= pagesToRead; pageNumber++) {
-        const tenders = await this._readCurrentPage();
+        const tenders = await this._readCurrentPage(existingApplyUrls);
         const fresh = tenders.filter(t => t && !seenIds.has(t.tender_id));
         fresh.forEach(t => seenIds.add(t.tender_id));
 
@@ -114,7 +115,33 @@ class GemScraper extends BaseScraper {
     }
   }
 
-  async _readCurrentPage() {
+  async _fetchExistingApplyUrls() {
+    const urls = new Map();
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+      const { data, error } = await supabase
+        .from('tenders')
+        .select('tender_id, apply_url')
+        .eq('portal', PORTAL)
+        .not('apply_url', 'is', null)
+        .range(from, from + pageSize - 1);
+      if (error) {
+        logger.warn(`[GeM] Could not load existing apply URLs: ${error.message}`);
+        break;
+      }
+      if (!data || data.length === 0) break;
+      data.forEach(row => {
+        if (row.tender_id && typeof row.apply_url === 'string' && row.apply_url.trim())
+          urls.set(row.tender_id, row.apply_url.trim());
+      });
+      if (data.length < pageSize) break;
+      from += pageSize;
+    }
+    return urls;
+  }
+
+  async _readCurrentPage(existingApplyUrls = new Map()) {
     return await this.page.$$eval(CARD_SELECTOR, cards => cards.map(card => {
       const bidLink = card.querySelector('a.bid_no_hover[href]');
       const itemColumn = card.querySelector('.card-body .col-md-4');
@@ -132,16 +159,20 @@ class GemScraper extends BaseScraper {
       const detailUrl = href ? new URL(href, window.location.href).href : '';
       if (!bidNumber || !title) return null;
       return { bidNumber, title, organization, endDate: endDate?.textContent?.trim() || '', detailUrl };
-    })).then(cards => cards.filter(Boolean).map(card => ({
-      portal: PORTAL,
-      tender_id: makeTenderId(card.bidNumber),
-      title: card.title.substring(0, 500),
-      organization: card.organization.substring(0, 300),
-      bid_end_date: parseDate(card.endDate),
-      detail_url: card.detailUrl.substring(0, 1000),
-      url: card.detailUrl.substring(0, 1000),
-      scraped_at: new Date().toISOString(),
-    })));
+    })).then(cards => cards.filter(Boolean).map(card => {
+      const tenderId = makeTenderId(card.bidNumber);
+      return {
+        portal: PORTAL,
+        tender_id: tenderId,
+        title: card.title.substring(0, 500),
+        organization: card.organization.substring(0, 300),
+        bid_end_date: parseDate(card.endDate),
+        detail_url: card.detailUrl.substring(0, 1000),
+        url: card.detailUrl.substring(0, 1000),
+        apply_url: existingApplyUrls.get(tenderId) || card.detailUrl || null,
+        scraped_at: new Date().toISOString(),
+      };
+    }));
   }
 
   async _pageFingerprint() {

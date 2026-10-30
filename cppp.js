@@ -65,26 +65,30 @@ function parseAmount(text) {
 // ─── Fetch tender IDs already enriched in DB ─────────────────────
 async function fetchEnrichedIds() {
   try {
-    const enriched = new Set();
+    const enrichedIds = new Set();
+    const existingApplyUrls = new Map();
     let from = 0;
     const pageSize = 1000;
     while (true) {
       const { data, error } = await supabase
         .from('tenders')
-        .select('tender_id')
+        .select('tender_id, details, apply_url')
         .eq('portal', 'cppp')
-        .not('details', 'is', null)
         .range(from, from + pageSize - 1);
       if (error || !data || data.length === 0) break;
-      data.forEach(r => enriched.add(r.tender_id));
+      data.forEach((row) => {
+        if (row.details !== null && row.details !== undefined) enrichedIds.add(row.tender_id);
+        if (typeof row.apply_url === 'string' && row.apply_url.trim())
+          existingApplyUrls.set(row.tender_id, row.apply_url.trim());
+      });
       if (data.length < pageSize) break;
       from += pageSize;
     }
-    logger.info('[CPPP] Skipping detail pages for ' + enriched.size + ' already-enriched tenders');
-    return enriched;
+    logger.info('[CPPP] Skipping detail pages for ' + enrichedIds.size + ' already-enriched tenders');
+    return { enrichedIds, existingApplyUrls };
   } catch (err) {
     logger.warn('[CPPP] Could not fetch enriched IDs: ' + err.message);
-    return new Set();
+    return { enrichedIds: new Set(), existingApplyUrls: new Map() };
   }
 }
 
@@ -297,7 +301,7 @@ class CpppScraper extends BaseScraper {
       logger.info(`[CPPP] URL: ${this.page.url()}`);
       const captchaEl = await this.page.$(SEL.captcha).catch(() => null);
       if (captchaEl) throw new Error('Captcha wall on CPPP tender listing page');
-      const enrichedIds = await fetchEnrichedIds();
+      const { enrichedIds, existingApplyUrls } = await fetchEnrichedIds();
 
       const tabs = [
         { label: 'Closing within 14 days', selector: SEL.tab14days },
@@ -326,7 +330,7 @@ class CpppScraper extends BaseScraper {
             logger.warn(`[CPPP] Stopping "${label}" after safety limit of ${MAX_PAGES_PER_TAB} pages`);
             break;
           }
-          const tenders = await this._scrapePage(enrichedIds, seenIds);
+          const tenders = await this._scrapePage(enrichedIds, seenIds, existingApplyUrls);
           const pageKey = await this._pageFingerprint();
           if (visitedPageKeys.has(pageKey)) {
             logger.warn(`[CPPP] Stopping "${label}": pagination returned to an already-seen page`);
@@ -366,7 +370,7 @@ class CpppScraper extends BaseScraper {
     }
   }
 
-  async _scrapePage(enrichedIds = new Set(), alreadySeenIds = new Set()) {
+  async _scrapePage(enrichedIds = new Set(), alreadySeenIds = new Set(), existingApplyUrls = new Map()) {
     const tenders = [];
     const rows = await this.page.$$(SEL.tableRows).catch(() => []);
 
@@ -420,10 +424,8 @@ class CpppScraper extends BaseScraper {
             // Skip detail page if already enriched
             const tenderId = makeTenderId(refNo, title);
             if (alreadySeenIds.has(tenderId)) continue;
-            if (enrichedIds.has(tenderId)) {
-              tenders.push({ tender_id: tenderId, title: title.substring(0, 500), organization: orgClean.substring(0, 200), portal: PORTAL, bid_end_date: parseDate(closing), url: (detailUrl || BASE_URL).substring(0, 1000), scraped_at: new Date().toISOString() });
-              continue;
-            }
+            // Do not upsert a sparse row: Supabase would replace previously saved detail fields.
+            if (enrichedIds.has(tenderId)) continue;
             const { estimatedValue, requiredDocuments, category, location, emdAmount, applyUrl, details } = await extractDetailPageData(this.page, detailUrl, BASE_URL).catch(() => ({ estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null }));
             if (estimatedValue) logger.info(`[CPPP] Extracted value ₹${estimatedValue} for "${title.substring(0, 40)}"`);
 
@@ -438,7 +440,7 @@ class CpppScraper extends BaseScraper {
               category:             category || null,
               location:             location || null,
               emd_amount:           emdAmount || null,
-              apply_url:            applyUrl || null,
+              apply_url:            applyUrl || existingApplyUrls.get(tenderId) || (detailUrl || null),
               details:              details || null,
               url:             (detailUrl || BASE_URL).substring(0, 1000),
               scraped_at:      new Date().toISOString(),
@@ -473,18 +475,8 @@ class CpppScraper extends BaseScraper {
 
         const tenderId = makeTenderId(refNo, title);
         if (alreadySeenIds.has(tenderId)) continue;
-        if (enrichedIds.has(tenderId)) {
-          tenders.push({
-            tender_id: tenderId,
-            title: title.substring(0, 500),
-            organization: orgClean.substring(0, 200),
-            portal: PORTAL,
-            bid_end_date: parseDate(closing),
-            url: (detailUrl || BASE_URL).substring(0, 1000),
-            scraped_at: new Date().toISOString(),
-          });
-          continue;
-        }
+        // Do not upsert a sparse row: Supabase would replace previously saved detail fields.
+        if (enrichedIds.has(tenderId)) continue;
 
         const { estimatedValue, requiredDocuments, category, location, emdAmount, applyUrl, details } = await extractDetailPageData(this.page, detailUrl, BASE_URL).catch(() => ({ estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null }));
 
@@ -499,7 +491,7 @@ class CpppScraper extends BaseScraper {
               category:             category || null,
               location:             location || null,
               emd_amount:           emdAmount || null,
-              apply_url:            applyUrl || null,
+              apply_url:            applyUrl || existingApplyUrls.get(tenderId) || (detailUrl || null),
               details:              details || null,
           url:             (detailUrl || BASE_URL).substring(0, 1000),
           scraped_at:      new Date().toISOString(),

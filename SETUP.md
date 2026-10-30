@@ -74,4 +74,10 @@ SELECT * FROM scraper_health;
 SELECT * FROM scraper_logs ORDER BY ran_at DESC LIMIT 20;
 ```
 
+### Populate `apply_url` for existing tenders
+
+New scraper runs save a direct tender-detail page in `apply_url` when a portal does not provide a separate application link. These links open the tender on its source portal; they do not bypass sign-in or portal submission steps.
+
+To fill currently blank `apply_url` values, open `backfill_apply_urls.sql` in the Supabase SQL Editor. First run its preview query and inspect the sample URLs. Then run the update statement. The update only copies recognized tender-specific links from the existing `url` column and leaves nonblank `apply_url` values untouched.
+
 Logs are written under `logs/` and uploaded as a GitHub Actions artifact after each run.
