@@ -31,9 +31,9 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
+      max-parallel: 6
       matrix:
         portal: [gem, cppp, tn, nic-mp, nic-odisha, nic-chandigarh, nic-delhi, nic-coal, nic-iocl, nic-ntpc, nic-cpcl, nic-bhel]
-        max-parallel: 6
     name: Scrape ${{ matrix.portal }}
     steps:
       - name: Check if portal should run
