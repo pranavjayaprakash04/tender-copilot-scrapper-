@@ -1,11 +1,13 @@
 require('dotenv').config();
 
+const crypto                           = require('crypto');
 const BaseScraper                      = require('./base');
 const { upsertTenders, logScraperRun, supabase } = require('./supabase');
 const logger                           = require('./logger');
 
-const HOME_URL = 'https://tntenders.gov.in/nicgep/app';
-const PORTAL   = 'tn';
+const HOME_URL = process.env.GEPNIC_HOME_URL || 'https://tntenders.gov.in/nicgep/app';
+const PORTAL   = process.env.GEPNIC_PORTAL_ID || 'tn';
+process.env.PORTAL = process.env.PORTAL || PORTAL;
 
 const SEL = {
   tendersByDate: 'a:has-text("Tenders by Closing Date")',
@@ -17,6 +19,7 @@ const SEL = {
 };
 
 const REF_NO_PATTERN = /[A-Z0-9][A-Z0-9\/\-\.\s]{1,}[0-9]/i;
+const MAX_PAGES_PER_TAB = Number.parseInt(process.env.TN_MAX_PAGES_PER_TAB, 10) || 100;
 
 const JUNK_PATTERNS = [
   /^function\s/i, /^<[a-z]/i, /window\./i, /document\./i,
@@ -69,7 +72,7 @@ async function fetchEnrichedIds() {
       const { data, error } = await supabase
         .from('tenders')
         .select('tender_id')
-        .eq('portal', 'tn')
+        .eq('portal', PORTAL)
         .not('details', 'is', null)
         .range(from, from + pageSize - 1);
       if (error || !data || data.length === 0) break;
@@ -92,6 +95,7 @@ async function extractDetailPageData(page, url, baseUrl) {
   try {
     logger.info('[TN] Visiting detail page: ' + url.substring(0, 80));
     const detailPage = await page.context().newPage();
+    try {
     await detailPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await detailPage.waitForTimeout(800);
 
@@ -139,14 +143,20 @@ async function extractDetailPageData(page, url, baseUrl) {
       const docs = [];
       const tables = Array.from(document.querySelectorAll('table'));
       for (const table of tables) {
-        const headers = Array.from(table.querySelectorAll('th')).map(th => th.innerText?.trim().toLowerCase());
+        const firstRow = table.querySelector('tr');
+        const headers = [
+          ...Array.from(table.querySelectorAll('th')).map(th => th.innerText?.trim().toLowerCase() || ''),
+          ...Array.from(firstRow?.querySelectorAll('td') || []).map(td => td.innerText?.trim().toLowerCase() || ''),
+        ];
         if (!headers.some(h => h.includes('document name'))) continue;
-        const tableRows = Array.from(table.querySelectorAll('tbody tr'));
+        const bodyRows = Array.from(table.querySelectorAll('tbody tr'));
+        const tableRows = bodyRows.length ? bodyRows : Array.from(table.querySelectorAll('tr')).slice(1);
         for (const row of tableRows) {
           const cells = Array.from(row.querySelectorAll('td'));
           if (cells.length < 2) continue;
-          const anchor = row.querySelector('a[href]');
-          const name = anchor?.innerText?.trim() || '';
+          const fileCell = cells.find(cell => /\.(pdf|xls|xlsx|doc|docx|zip)\b/i.test(cell.innerText?.trim() || ''));
+          const anchor = fileCell?.querySelector('a[href]') || null;
+          const name = anchor?.innerText?.trim() || fileCell?.innerText?.trim() || '';
           if (!name || !/\.(pdf|xls|xlsx|doc|docx|zip)/i.test(name)) continue;
           const cellTexts = cells.map(c => c.innerText?.trim());
           const description = cellTexts.find(t => t && t !== name && !/^\d+$/.test(t) && t.length > 1 && !/^s\.?no/i.test(t)) || '';
@@ -156,7 +166,7 @@ async function extractDetailPageData(page, url, baseUrl) {
             name,
             description: description || null,
             size_kb: sizeText ? parseFloat(sizeText) : null,
-            url: href || null,
+            url: href ? new URL(href, window.location.href).href : null,
           });
         }
       }
@@ -181,7 +191,6 @@ async function extractDetailPageData(page, url, baseUrl) {
       return { estimatedValue, requiredDocuments: docs, category, location, emdAmount, applyUrl, details };
     }, VALUE_KEYWORDS);
 
-    await detailPage.close();
     logger.info('[TN] Detail page extracted — value=' + result.estimatedValue + ' category=' + result.category + ' location=' + result.location);
     return {
       estimatedValue:    parseAmount(result.estimatedValue),
@@ -192,6 +201,9 @@ async function extractDetailPageData(page, url, baseUrl) {
       applyUrl:          result.applyUrl || null,
       details:           Object.keys(result.details).length > 0 ? result.details : null,
     };
+    } finally {
+      await detailPage.close().catch(() => {});
+    }
   } catch (err) {
     logger.warn('[TN] Detail page failed: ' + err.message);
     return { estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null };
@@ -223,22 +235,63 @@ function isValidTender(title, refNo) {
 
 function parseDate(raw) {
   if (!raw) return null;
-  const m1 = raw.match(/(\d{1,2})[-\s\/](\w{3})[-\s\/](\d{4})/);
-  if (m1) { const d = new Date(`${m1[1]} ${m1[2]} ${m1[3]}`); if (!isNaN(d.getTime())) return d.toISOString(); }
-  const m2 = raw.match(/(\d{1,2})[-\/](\d{2})[-\/](\d{4})/);
-  if (m2) { const d = new Date(`${m2[3]}-${m2[2]}-${m2[1]}`); if (!isNaN(d.getTime())) return d.toISOString(); }
-  return null;
+  // NIC portals display times in India Standard Time; normalize them to UTC
+  // before writing to the TIMESTAMPTZ column.
+  const months = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+  const timePattern = '(?:\\s+(\\d{1,2}):(\\d{2})(?::(\\d{2}))?\\s*(AM|PM)?)?';
+  const m1 = raw.match(new RegExp(`(\\d{1,2})[-\\s/](\\w{3,9})[-\\s/](\\d{4})${timePattern}`, 'i'));
+  const m2 = raw.match(new RegExp(`(\\d{1,2})[-/](\\d{1,2})[-/](\\d{4})${timePattern}`, 'i'));
+
+  let day, month, year, hour, minute, second, hasTime;
+  if (m1 && months[m1[2].slice(0, 3).toLowerCase()] !== undefined) {
+    [, day, , year, hour, minute, second] = m1;
+    month = months[m1[2].slice(0, 3).toLowerCase()];
+    hasTime = Boolean(hour);
+    if (m1[7]) hour = Number(hour) % 12 + (m1[7].toUpperCase() === 'PM' ? 12 : 0);
+  } else if (m2) {
+    [, day, month, year, hour, minute, second] = m2;
+    month = Number(month) - 1;
+    hasTime = Boolean(hour);
+    if (m2[7]) hour = Number(hour) % 12 + (m2[7].toUpperCase() === 'PM' ? 12 : 0);
+  } else {
+    return null;
+  }
+
+  day = Number(day);
+  year = Number(year);
+  hour = Number(hour || 0);
+  minute = Number(minute || 0);
+  second = Number(second || 0);
+  if (month < 0 || month > 11 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return null;
+
+  const utc = Date.UTC(year, month, day, hour, minute, second) - (hasTime ? 330 * 60 * 1000 : 0);
+  const date = new Date(utc);
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month || date.getUTCDate() !== day) return null;
+  return date.toISOString();
 }
 
-function makeTenderId(refNo, title) {
-  const base = (refNo && REF_NO_PATTERN.test(refNo))
-    ? refNo.replace(/\s+/g, '')
-    : title.replace(/\s+/g, '').substring(0, 80);
-  return `TN-${base}`.substring(0, 200);
+function makeTenderId(refNo, title, systemId = null) {
+  // New GePNIC instances publish a stable system ID alongside a reference
+  // number; references can repeat, so use that ID for those portals. Keep the
+  // existing TN key format to avoid changing IDs already stored for that portal.
+  let base;
+  if (PORTAL !== 'tn' && systemId) {
+    base = systemId.replace(/\s+/g, '');
+  } else if (refNo && REF_NO_PATTERN.test(refNo)) {
+    base = refNo.replace(/\s+/g, '');
+    if (PORTAL !== 'tn') {
+      const titleHash = crypto.createHash('sha1').update(title.toLowerCase().trim()).digest('hex').slice(0, 10);
+      base = `${base}-${titleHash}`;
+    }
+  } else {
+    base = title.replace(/\s+/g, '').substring(0, 80);
+  }
+  return `${PORTAL.toUpperCase()}-${base}`.substring(0, 200);
 }
 
 function parseTitleCell(titleCell) {
   const bracketContents = [...titleCell.matchAll(/\[([^\]]+)\]/g)].map(m => m[1]);
+  const systemId = bracketContents.find(b => /^\d{4}_[A-Z0-9]+_\d+_\d+$/i.test(b.trim())) || null;
   const beforeBracket   = titleCell.split('[')[0].trim();
   let title = '', refNo = '';
 
@@ -265,7 +318,7 @@ function parseTitleCell(titleCell) {
     }
   }
   if (!title && beforeBracket.length > 5) title = cleanTitle(beforeBracket);
-  return { title, refNo };
+  return { title, refNo, systemId };
 }
 
 class TnScraper extends BaseScraper {
@@ -315,8 +368,19 @@ class TnScraper extends BaseScraper {
         }
 
         let pageNum = 1;
+        const visitedPageKeys = new Set();
         while (true) {
-          const tenders = await this._scrapePage(enrichedIds);
+          if (pageNum > MAX_PAGES_PER_TAB) {
+            logger.warn(`[TN] Stopping "${label}" after safety limit of ${MAX_PAGES_PER_TAB} pages`);
+            break;
+          }
+          const tenders = await this._scrapePage(enrichedIds, seenIds);
+          const pageKey = await this._pageFingerprint();
+          if (visitedPageKeys.has(pageKey)) {
+            logger.warn(`[TN] Stopping "${label}": pagination returned to an already-seen page`);
+            break;
+          }
+          visitedPageKeys.add(pageKey);
           const newTenders = tenders.filter(t => !seenIds.has(t.tender_id));
           newTenders.forEach(t => seenIds.add(t.tender_id));
 
@@ -327,7 +391,7 @@ class TnScraper extends BaseScraper {
             totalScraped += newTenders.length;
           }
 
-          if (tenders.length === 0 && pageNum > 1) break;
+          if (tenders.length === 0) break;
           const hasNext = await this._goToNextPage();
           if (!hasNext) break;
           pageNum++;
@@ -342,27 +406,26 @@ class TnScraper extends BaseScraper {
     } catch (err) {
       logger.error(`TN failed: ${err.message}`);
       await logScraperRun({ portal: PORTAL, status: 'error', count: totalScraped, message: err.message }).catch(() => {});
-      process.exit(1);
+      process.exitCode = 1;
     } finally {
       await this.cleanup();
     }
   }
 
-  async _scrapePage(enrichedIds = new Set()) {
+  async _scrapePage(enrichedIds = new Set(), alreadySeenIds = new Set()) {
     const tenders = [];
     const rows = await this.page.$$(SEL.tableRows).catch(() => []);
 
     for (const row of rows) {
       try {
-        const cells = await row.$$('td');
+        const cells = await row.$$('css=:scope > td');
+        const getText = async (el) => {
+          try { return (await el.textContent())?.trim().replace(/\s+/g, ' ') ?? ''; }
+          catch { return ''; }
+        };
+        const allCells = await Promise.all(cells.map(getText));
 
-        if (cells.length >= 12) {
-          const getText = async (el) => {
-            try { return (await el.textContent())?.trim().replace(/\s+/g, ' ') ?? ''; }
-            catch { return ''; }
-          };
-          const allCells = await Promise.all(cells.map(getText));
-
+        if (cells.length >= 12 && this._looksLikeTenderList(allCells)) {
           let dataStart = -1;
           for (let i = 0; i < allCells.length - 5; i++) {
             const v = allCells[i].toLowerCase();
@@ -386,7 +449,7 @@ class TnScraper extends BaseScraper {
 
             if (sno && !/^\d+\.?$/.test(sno.trim())) break;
 
-            const { title, refNo } = parseTitleCell(titleCell);
+            const { title, refNo, systemId } = parseTitleCell(titleCell);
             const orgClean = (org || 'Tamil Nadu Government')
               .split('||').map(s => s.trim()).filter(Boolean).pop() || 'Tamil Nadu Government';
 
@@ -401,21 +464,22 @@ class TnScraper extends BaseScraper {
             if (rawHref) {
               detailUrl = rawHref.startsWith('http')
                 ? rawHref
-                : `https://tntenders.gov.in${rawHref}`;
+                : new URL(rawHref, HOME_URL).href;
             }
             linkIdx++;
 
             // Skip detail page if already enriched
-            const tenderId = makeTenderId(refNo, title);
+            const tenderId = makeTenderId(refNo, title, systemId);
+            if (alreadySeenIds.has(tenderId)) continue;
             if (enrichedIds.has(tenderId)) {
-              tenders.push({ tender_id: tenderId, title: title.substring(0, 500), organization: orgClean.substring(0, 200), portal: PORTAL, bid_end_date: parseDate(closing), url: (detailUrl || (typeof HOME_URL !== "undefined" ? HOME_URL : BASE_URL)).substring(0, 1000), scraped_at: new Date().toISOString() });
+              tenders.push({ tender_id: tenderId, title: title.substring(0, 500), organization: orgClean.substring(0, 200), portal: PORTAL, bid_end_date: parseDate(closing), url: (detailUrl || HOME_URL).substring(0, 1000), scraped_at: new Date().toISOString() });
               continue;
             }
             const { estimatedValue, requiredDocuments, category, location, emdAmount, applyUrl, details } = await extractDetailPageData(this.page, detailUrl, HOME_URL).catch(() => ({ estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null }));
             if (estimatedValue) logger.info(`[TN] Extracted value ₹${estimatedValue} for "${title.substring(0, 40)}"`);
 
             tenders.push({
-              tender_id:       makeTenderId(refNo, title),
+              tender_id:       makeTenderId(refNo, title, systemId),
               title:           title.substring(0, 500),
               organization:    orgClean.substring(0, 200),
               portal:          PORTAL,
@@ -434,7 +498,7 @@ class TnScraper extends BaseScraper {
           continue;
         }
 
-        const t = await this._extractRow(row);
+        const t = await this._extractRow(row, enrichedIds, alreadySeenIds);
         if (t) tenders.push(t);
 
       } catch (err) {
@@ -444,8 +508,8 @@ class TnScraper extends BaseScraper {
     return tenders;
   }
 
-  async _extractRow(row) {
-    const cells = await row.$$('td');
+  async _extractRow(row, enrichedIds = new Set(), alreadySeenIds = new Set()) {
+    const cells = await row.$$('css=:scope > td');
     if (cells.length < 2) return null;
 
     const getText = async (el) => {
@@ -455,7 +519,7 @@ class TnScraper extends BaseScraper {
     const allCells = await Promise.all(cells.map(getText));
 
     if (allCells.length >= 5) {
-      const { title, refNo } = parseTitleCell(allCells[4] || '');
+      const { title, refNo, systemId } = parseTitleCell(allCells[4] || '');
       const org     = allCells[5] || 'Tamil Nadu Government';
       const closing = allCells[2] || '';
       const orgClean = org.split('||').map(s => s.trim()).filter(Boolean).pop() || 'Tamil Nadu Government';
@@ -466,14 +530,28 @@ class TnScraper extends BaseScraper {
         const a = await row.$('td:nth-child(5) a[href]');
         if (a) {
           const href = await a.getAttribute('href');
-          detailUrl = href?.startsWith('http') ? href : `https://tntenders.gov.in${href}`;
+          detailUrl = href ? new URL(href, HOME_URL).href : '';
         }
       } catch {}
+
+      const tenderId = makeTenderId(refNo, title, systemId);
+      if (alreadySeenIds.has(tenderId)) return null;
+      if (enrichedIds.has(tenderId)) {
+        return {
+          tender_id: tenderId,
+          title: title.substring(0, 500),
+          organization: orgClean.substring(0, 200),
+          portal: PORTAL,
+          bid_end_date: parseDate(closing),
+          url: (detailUrl || HOME_URL).substring(0, 1000),
+          scraped_at: new Date().toISOString(),
+        };
+      }
 
       const { estimatedValue, requiredDocuments, category, location, emdAmount, applyUrl, details } = await extractDetailPageData(this.page, detailUrl, HOME_URL).catch(() => ({ estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null }));
 
       return {
-        tender_id:       makeTenderId(refNo, title),
+        tender_id:       tenderId,
         title:           title.substring(0, 500),
         organization:    orgClean.substring(0, 200),
         portal:          PORTAL,
@@ -490,7 +568,7 @@ class TnScraper extends BaseScraper {
       };
     }
 
-    const { title, refNo } = parseTitleCell(allCells[0].replace(/^\d+\.\s*/, '').trim());
+    const { title, refNo, systemId } = parseTitleCell(allCells[0].replace(/^\d+\.\s*/, '').trim());
     const closingRaw = allCells[2] || '';
     if (!isValidTender(title, refNo)) return null;
 
@@ -499,14 +577,28 @@ class TnScraper extends BaseScraper {
       const a = await row.$('a[href]');
       if (a) {
         const href = await a.getAttribute('href');
-        detailUrl = href?.startsWith('http') ? href : `https://tntenders.gov.in${href}`;
+        detailUrl = href ? new URL(href, HOME_URL).href : '';
       }
     } catch {}
+
+    const tenderId = makeTenderId(refNo, title, systemId);
+    if (alreadySeenIds.has(tenderId)) return null;
+    if (enrichedIds.has(tenderId)) {
+      return {
+        tender_id: tenderId,
+        title: title.substring(0, 500),
+        organization: 'Tamil Nadu Government',
+        portal: PORTAL,
+        bid_end_date: parseDate(closingRaw),
+        url: (detailUrl || HOME_URL).substring(0, 1000),
+        scraped_at: new Date().toISOString(),
+      };
+    }
 
     const { estimatedValue, requiredDocuments, category, location, emdAmount, applyUrl, details } = await extractDetailPageData(this.page, detailUrl, HOME_URL).catch(() => ({ estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null }));
 
     return {
-      tender_id:       makeTenderId(refNo, title),
+      tender_id:       tenderId,
       title:           title.substring(0, 500),
       organization:    'Tamil Nadu Government',
       portal:          PORTAL,
@@ -528,22 +620,51 @@ class TnScraper extends BaseScraper {
       const allLinks = await this.page.$$('a');
       for (const link of allLinks) {
         const text = (await link.textContent().catch(() => '')).trim();
-        if (text === '>') {
+        const disabled = await link.evaluate(el => el.closest('li')?.classList.contains('disabled') || el.getAttribute('aria-disabled') === 'true').catch(() => false);
+        if (text === '>' && !disabled) {
+          const before = await this._pageFingerprint();
           await link.click();
-          await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-          await this.page.waitForTimeout(1500);
+          try {
+            await this.page.waitForFunction((previous) => {
+              const rows = Array.from(document.querySelectorAll('table tbody tr'));
+              const text = rows.map(row => row.innerText.replace(/\s+/g, ' ').trim()).filter(Boolean).join('|');
+              return `${location.href}::${text}` !== previous;
+            }, before, { timeout: 8000 });
+          } catch {
+            return false;
+          }
           return true;
         }
       }
       return false;
     } catch { return false; }
   }
+
+  _looksLikeTenderList(cells) {
+    // The portal page contains many unrelated tables. Only parse the wide table
+    // whose repeating six-cell groups begin with serial numbers.
+    return cells.length >= 12 && cells.some((value, i) =>
+      /^(?:s\.?\s*no|sno|sl\.?\s*no)$/i.test(value) && i + 6 < cells.length
+    ) || cells.length >= 12 && /^\d+\.?$/.test(cells[0] || '') && /\[[^\]]+\]/.test(cells[4] || '');
+  }
+
+  async _pageFingerprint() {
+    try {
+      return await this.page.evaluate(() => {
+        const rows = Array.from(document.querySelectorAll('table tbody tr'));
+        const text = rows.map(row => row.innerText.replace(/\s+/g, ' ').trim()).filter(Boolean).join('|');
+        return `${location.href}::${text}`;
+      });
+    } catch {
+      return this.page.url();
+    }
+  }
 }
 
 if (require.main === module) {
   new TnScraper().run().catch((err) => {
     logger.error(`Unhandled error: ${err.message}`);
-    process.exit(1);
+    process.exitCode = 1;
   });
 }
 

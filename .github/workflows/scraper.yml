@@ -15,54 +15,53 @@ on:
           - gem
           - cppp
           - tn
+          - nic-mp
+          - nic-odisha
+          - nic-chandigarh
+          - nic-delhi
+          - nic-coal
+          - nic-iocl
+          - nic-ntpc
+          - nic-cpcl
+          - nic-bhel
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-
     strategy:
       fail-fast: false
       matrix:
-        portal: [gem, cppp, tn]
-
+        portal: [gem, cppp, tn, nic-mp, nic-odisha, nic-chandigarh, nic-delhi, nic-coal, nic-iocl, nic-ntpc, nic-cpcl, nic-bhel]
+        max-parallel: 6
     name: Scrape ${{ matrix.portal }}
-
     steps:
       - name: Check if portal should run
         id: check
+        env:
+          SELECTED_PORTAL: ${{ github.event.inputs.portal || 'all' }}
+          PORTAL: ${{ matrix.portal }}
         run: |
-          SELECTED="${{ github.event.inputs.portal || 'all' }}"
-          PORTAL="${{ matrix.portal }}"
-          if [ "$SELECTED" = "all" ] || [ "$SELECTED" = "$PORTAL" ]; then
+          if [ "$SELECTED_PORTAL" = "all" ] || [ "$SELECTED_PORTAL" = "$PORTAL" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Checkout code
+      - name: Checkout repository
         if: steps.check.outputs.run == 'true'
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Setup Node.js
         if: steps.check.outputs.run == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-
-      - name: Set up Python
-        if: steps.check.outputs.run == 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install CAPTCHA solver
-        if: steps.check.outputs.run == 'true'
-        run: pip install ddddocr
+          cache: npm
 
       - name: Install Node dependencies
         if: steps.check.outputs.run == 'true'
-        run: npm install
+        run: npm ci
 
       - name: Install Playwright Chromium
         if: steps.check.outputs.run == 'true'
@@ -72,15 +71,20 @@ jobs:
         if: steps.check.outputs.run == 'true'
         run: mkdir -p logs
 
-      - name: Run scraper
+      - name: Run ${{ matrix.portal }} scraper
         if: steps.check.outputs.run == 'true'
         env:
+          PORTAL: ${{ matrix.portal }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          CAPTCHA_RETRY_LIMIT: 10
           REQUEST_DELAY_MIN: 2000
           REQUEST_DELAY_MAX: 5000
-        run: node ${{ matrix.portal }}.js
+        run: |
+          case "$PORTAL" in
+            gem|cppp|tn) node "$PORTAL.js" ;;
+            nic-*) node gepnic.js "$PORTAL" ;;
+            *) echo "Unknown portal: $PORTAL" >&2; exit 2 ;;
+          esac
 
       - name: Upload scraper logs
         if: always() && steps.check.outputs.run == 'true'
@@ -89,4 +93,3 @@ jobs:
           name: logs-${{ matrix.portal }}-${{ github.run_number }}
           path: logs/
           retention-days: 7
-          

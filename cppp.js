@@ -6,9 +6,11 @@ const logger                           = require('./logger');
 
 const BASE_URL = 'https://eprocure.gov.in/eprocure/app?page=FrontEndListTendersbyDate&service=page';
 const PORTAL   = 'cppp';
+process.env.PORTAL = process.env.PORTAL || PORTAL;
 
 const SEL = {
   tableRows: 'table tbody tr',
+  captcha:   '#captchaImage, img[src*="captcha"], input[name*="captcha"], input[id*="captcha"]',
   tab14days: 'a:has-text("Closing within 14 days")',
   tab7days:  'a:has-text("Closing within 7 days")',
   tabToday:  'a:has-text("Closing Today")',
@@ -34,6 +36,7 @@ function isNoise(title) {
 }
 
 const REF_NO_PATTERN = /[A-Z0-9][A-Z0-9\/\-\.\s]{1,}[0-9]/i;
+const MAX_PAGES_PER_TAB = Number.parseInt(process.env.CPPP_MAX_PAGES_PER_TAB, 10) || 100;
 
 // ─── Estimated value helpers ─────────────────────────────────────
 
@@ -92,6 +95,7 @@ async function extractDetailPageData(page, url, baseUrl) {
   try {
     logger.info('[CPPP] Visiting detail page: ' + url.substring(0, 80));
     const detailPage = await page.context().newPage();
+    try {
     await detailPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await detailPage.waitForTimeout(800);
 
@@ -139,14 +143,22 @@ async function extractDetailPageData(page, url, baseUrl) {
       const docs = [];
       const tables = Array.from(document.querySelectorAll('table'));
       for (const table of tables) {
-        const headers = Array.from(table.querySelectorAll('th')).map(th => th.innerText?.trim().toLowerCase());
+        const firstRow = table.querySelector('tr');
+        const headers = [
+          ...Array.from(table.querySelectorAll('th')).map(th => th.innerText?.trim().toLowerCase() || ''),
+          ...Array.from(firstRow?.querySelectorAll(':scope > td') || [])
+            .filter(td => !td.querySelector('table'))
+            .map(td => td.innerText?.trim().toLowerCase() || ''),
+        ];
         if (!headers.some(h => h.includes('document name'))) continue;
-        const tableRows = Array.from(table.querySelectorAll('tbody tr'));
+        const bodyRows = Array.from(table.querySelectorAll('tbody tr'));
+        const tableRows = bodyRows.length ? bodyRows : Array.from(table.querySelectorAll('tr')).slice(1);
         for (const row of tableRows) {
           const cells = Array.from(row.querySelectorAll('td'));
           if (cells.length < 2) continue;
-          const anchor = row.querySelector('a[href]');
-          const name = anchor?.innerText?.trim() || '';
+          const fileCell = cells.find(cell => /\.(pdf|xls|xlsx|doc|docx|zip)\b/i.test(cell.innerText?.trim() || ''));
+          const anchor = fileCell?.querySelector('a[href]') || null;
+          const name = anchor?.innerText?.trim() || fileCell?.innerText?.trim() || '';
           if (!name || !/\.(pdf|xls|xlsx|doc|docx|zip)/i.test(name)) continue;
           const cellTexts = cells.map(c => c.innerText?.trim());
           const description = cellTexts.find(t => t && t !== name && !/^\d+$/.test(t) && t.length > 1 && !/^s\.?no/i.test(t)) || '';
@@ -156,7 +168,7 @@ async function extractDetailPageData(page, url, baseUrl) {
             name,
             description: description || null,
             size_kb: sizeText ? parseFloat(sizeText) : null,
-            url: href || null,
+            url: href ? new URL(href, window.location.href).href : null,
           });
         }
       }
@@ -181,7 +193,6 @@ async function extractDetailPageData(page, url, baseUrl) {
       return { estimatedValue, requiredDocuments: docs, category, location, emdAmount, applyUrl, details };
     }, VALUE_KEYWORDS);
 
-    await detailPage.close();
     logger.info('[CPPP] Detail page extracted — value=' + result.estimatedValue + ' category=' + result.category + ' location=' + result.location);
     return {
       estimatedValue:    parseAmount(result.estimatedValue),
@@ -192,6 +203,9 @@ async function extractDetailPageData(page, url, baseUrl) {
       applyUrl:          result.applyUrl || null,
       details:           Object.keys(result.details).length > 0 ? result.details : null,
     };
+    } finally {
+      await detailPage.close().catch(() => {});
+    }
   } catch (err) {
     logger.warn('[CPPP] Detail page failed: ' + err.message);
     return { estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null };
@@ -204,12 +218,33 @@ async function extractDetailPageData(page, url, baseUrl) {
 
 function parseDate(raw) {
   if (!raw) return null;
-  const m1 = raw.match(/(\d{1,2})[-\s\/](\w{3})[-\s\/](\d{4})/);
-  if (m1) { const d = new Date(`${m1[1]} ${m1[2]} ${m1[3]}`); if (!isNaN(d.getTime())) return d.toISOString(); }
-  const m2 = raw.match(/(\d{1,2})[-\/](\d{2})[-\/](\d{4})/);
-  if (m2) { const d = new Date(`${m2[3]}-${m2[2]}-${m2[1]}`); if (!isNaN(d.getTime())) return d.toISOString(); }
-  const d = new Date(raw.trim());
-  return isNaN(d.getTime()) ? null : d.toISOString();
+  // CPPP dates with a time are displayed in India Standard Time.
+  const months = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+  const timePattern = '(?:\\s+(\\d{1,2}):(\\d{2})(?::(\\d{2}))?\\s*(AM|PM)?)?';
+  const m1 = raw.match(new RegExp(`(\\d{1,2})[-\\s/](\\w{3,9})[-\\s/](\\d{4})${timePattern}`, 'i'));
+  const m2 = raw.match(new RegExp(`(\\d{1,2})[-/](\\d{1,2})[-/](\\d{4})${timePattern}`, 'i'));
+  let day, month, year, hour, minute, second, hasTime;
+  if (m1 && months[m1[2].slice(0, 3).toLowerCase()] !== undefined) {
+    [, day, , year, hour, minute, second] = m1;
+    month = months[m1[2].slice(0, 3).toLowerCase()];
+    hasTime = Boolean(hour);
+    if (m1[7]) hour = Number(hour) % 12 + (m1[7].toUpperCase() === 'PM' ? 12 : 0);
+  } else if (m2) {
+    [, day, month, year, hour, minute, second] = m2;
+    month = Number(month) - 1;
+    hasTime = Boolean(hour);
+    if (m2[7]) hour = Number(hour) % 12 + (m2[7].toUpperCase() === 'PM' ? 12 : 0);
+  } else {
+    const date = new Date(raw.trim());
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  }
+  day = Number(day); year = Number(year); hour = Number(hour || 0);
+  minute = Number(minute || 0); second = Number(second || 0);
+  if (month < 0 || month > 11 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return null;
+  const utc = Date.UTC(year, month, day, hour, minute, second) - (hasTime ? 330 * 60 * 1000 : 0);
+  const date = new Date(utc);
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month || date.getUTCDate() !== day) return null;
+  return date.toISOString();
 }
 
 function makeTenderId(refNo, title) {
@@ -260,6 +295,8 @@ class CpppScraper extends BaseScraper {
       const ok = await this.navigateTo(BASE_URL);
       if (!ok) throw new Error('Failed to load CPPP page');
       logger.info(`[CPPP] URL: ${this.page.url()}`);
+      const captchaEl = await this.page.$(SEL.captcha).catch(() => null);
+      if (captchaEl) throw new Error('Captcha wall on CPPP tender listing page');
       const enrichedIds = await fetchEnrichedIds();
 
       const tabs = [
@@ -268,12 +305,14 @@ class CpppScraper extends BaseScraper {
         { label: 'Closing Today',          selector: SEL.tabToday },
       ];
 
+      let tabsClicked = 0;
       for (const { label, selector } of tabs) {
         try {
           const tabEl = await this.page.$(selector);
           if (!tabEl) { logger.warn(`[CPPP] Tab not found: ${label}`); continue; }
           await tabEl.click();
           await this.page.waitForTimeout(3000);
+          tabsClicked++;
           logger.info(`[CPPP] Clicked tab: ${label}`);
         } catch (err) {
           logger.warn(`[CPPP] Tab click failed "${label}": ${err.message}`);
@@ -281,8 +320,19 @@ class CpppScraper extends BaseScraper {
         }
 
         let pageNum = 1;
+        const visitedPageKeys = new Set();
         while (true) {
-          const tenders = await this._scrapePage(enrichedIds);
+          if (pageNum > MAX_PAGES_PER_TAB) {
+            logger.warn(`[CPPP] Stopping "${label}" after safety limit of ${MAX_PAGES_PER_TAB} pages`);
+            break;
+          }
+          const tenders = await this._scrapePage(enrichedIds, seenIds);
+          const pageKey = await this._pageFingerprint();
+          if (visitedPageKeys.has(pageKey)) {
+            logger.warn(`[CPPP] Stopping "${label}": pagination returned to an already-seen page`);
+            break;
+          }
+          visitedPageKeys.add(pageKey);
           const newTenders = tenders.filter(t => !seenIds.has(t.tender_id) && !isNoise(t.title));
           newTenders.forEach(t => seenIds.add(t.tender_id));
 
@@ -293,13 +343,15 @@ class CpppScraper extends BaseScraper {
             totalScraped += newTenders.length;
           }
 
-          if (tenders.length === 0 && pageNum > 1) break;
+          if (tenders.length === 0) break;
           const hasNext = await this._goToNextPage();
           if (!hasNext) break;
           pageNum++;
           await this.randomDelay();
         }
       }
+
+      if (tabsClicked === 0) throw new Error('No expected closing-date tabs were found on CPPP');
 
       const duration = ((Date.now() - startTime) / 1000).toFixed(1);
       logger.info(`CPPP done. ${totalScraped} total tenders in ${duration}s`);
@@ -308,19 +360,19 @@ class CpppScraper extends BaseScraper {
     } catch (err) {
       logger.error(`CPPP failed: ${err.message}`);
       await logScraperRun({ portal: PORTAL, status: 'error', count: totalScraped, message: err.message }).catch(() => {});
-      process.exit(1);
+      process.exitCode = 1;
     } finally {
       await this.cleanup();
     }
   }
 
-  async _scrapePage(enrichedIds = new Set()) {
+  async _scrapePage(enrichedIds = new Set(), alreadySeenIds = new Set()) {
     const tenders = [];
     const rows = await this.page.$$(SEL.tableRows).catch(() => []);
 
     for (const row of rows) {
       try {
-        const cells = await row.$$('td');
+        const cells = await row.$$('css=:scope > td');
 
         if (cells.length >= 12) {
           const getText = async (el) => {
@@ -361,15 +413,15 @@ class CpppScraper extends BaseScraper {
             let detailUrl = '';
             const rawHref = anchorHrefs[linkIdx] || '';
             if (rawHref) {
-              detailUrl = rawHref.startsWith('http') ? rawHref : `https://eprocure.gov.in${rawHref}`;
+              detailUrl = new URL(rawHref, BASE_URL).href;
             }
             linkIdx++;
 
             // Skip detail page if already enriched
             const tenderId = makeTenderId(refNo, title);
+            if (alreadySeenIds.has(tenderId)) continue;
             if (enrichedIds.has(tenderId)) {
               tenders.push({ tender_id: tenderId, title: title.substring(0, 500), organization: orgClean.substring(0, 200), portal: PORTAL, bid_end_date: parseDate(closing), url: (detailUrl || BASE_URL).substring(0, 1000), scraped_at: new Date().toISOString() });
-              linkIdx++;
               continue;
             }
             const { estimatedValue, requiredDocuments, category, location, emdAmount, applyUrl, details } = await extractDetailPageData(this.page, detailUrl, BASE_URL).catch(() => ({ estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null }));
@@ -415,14 +467,29 @@ class CpppScraper extends BaseScraper {
           const a = await row.$('a[href]');
           if (a) {
             const href = await a.getAttribute('href');
-            detailUrl = href?.startsWith('http') ? href : `https://eprocure.gov.in${href}`;
+            detailUrl = href ? new URL(href, BASE_URL).href : '';
           }
         } catch {}
+
+        const tenderId = makeTenderId(refNo, title);
+        if (alreadySeenIds.has(tenderId)) continue;
+        if (enrichedIds.has(tenderId)) {
+          tenders.push({
+            tender_id: tenderId,
+            title: title.substring(0, 500),
+            organization: orgClean.substring(0, 200),
+            portal: PORTAL,
+            bid_end_date: parseDate(closing),
+            url: (detailUrl || BASE_URL).substring(0, 1000),
+            scraped_at: new Date().toISOString(),
+          });
+          continue;
+        }
 
         const { estimatedValue, requiredDocuments, category, location, emdAmount, applyUrl, details } = await extractDetailPageData(this.page, detailUrl, BASE_URL).catch(() => ({ estimatedValue: null, requiredDocuments: [], category: null, location: null, emdAmount: null, applyUrl: null, details: null }));
 
         tenders.push({
-          tender_id:       makeTenderId(refNo, title),
+          tender_id:       tenderId,
           title:           title.substring(0, 500),
           organization:    orgClean.substring(0, 200),
           portal:          PORTAL,
@@ -450,22 +517,43 @@ class CpppScraper extends BaseScraper {
       const allLinks = await this.page.$$('a');
       for (const link of allLinks) {
         const text = (await link.textContent().catch(() => '')).trim();
-        if (text === '>') {
+        const disabled = await link.evaluate(el => el.closest('li')?.classList.contains('disabled') || el.getAttribute('aria-disabled') === 'true').catch(() => false);
+        if (text === '>' && !disabled) {
+          const before = await this._pageFingerprint();
           await link.click();
-          await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-          await this.page.waitForTimeout(1500);
+          try {
+            await this.page.waitForFunction((previous) => {
+              const rows = Array.from(document.querySelectorAll('table tbody tr'));
+              const text = rows.map(row => row.innerText.replace(/\s+/g, ' ').trim()).filter(Boolean).join('|');
+              return `${location.href}::${text}` !== previous;
+            }, before, { timeout: 8000 });
+          } catch {
+            return false;
+          }
           return true;
         }
       }
       return false;
     } catch { return false; }
   }
+
+  async _pageFingerprint() {
+    try {
+      return await this.page.evaluate(() => {
+        const rows = Array.from(document.querySelectorAll('table tbody tr'));
+        const text = rows.map(row => row.innerText.replace(/\s+/g, ' ').trim()).filter(Boolean).join('|');
+        return `${location.href}::${text}`;
+      });
+    } catch {
+      return this.page.url();
+    }
+  }
 }
 
 if (require.main === module) {
   new CpppScraper().run().catch((err) => {
     logger.error(`Unhandled error: ${err.message}`);
-    process.exit(1);
+    process.exitCode = 1;
   });
 }
 

@@ -20,7 +20,7 @@ const JUNK_PATTERNS = [
 
 function isJunkTender(t) {
   if (!t.tender_id || !t.title) return true;
-  if (t.title.length > 400) return true;
+  if (String(t.title).length > 1000) return true;
   if (t.tender_id.length > 200) return true;
   for (const pat of JUNK_PATTERNS) {
     if (pat.test(t.title)) return true;

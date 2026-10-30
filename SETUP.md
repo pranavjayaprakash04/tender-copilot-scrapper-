@@ -1,119 +1,77 @@
-# TenderPilot Scraper — GitHub Actions Setup
-## Zero cost. Zero credit card. Runs forever.
+# TenderPilot Scraper
 
----
+This repository scrapes public tender listings from GeM, CPPP, Tamil Nadu Tenders, and selected NIC GePNIC portals. Results are written to Supabase.
 
-## How It Works
+## Supported portal jobs
 
-```
-GitHub (free)
-  └── Every 2 hours: spins up Ubuntu VM automatically
-  └── Installs Node, Python, Playwright, ddddocr
-  └── Runs all 3 scrapers IN PARALLEL
-  └── Uploads tenders to Supabase
-  └── Shuts down VM (you pay nothing)
-  └── Repeats in 2 hours
-```
+The GitHub Actions workflow runs each selected portal in its own job. Scheduled runs retain the two-hour cadence.
 
----
+| Workflow portal | Source |
+|---|---|
+| `gem` | Government e-Marketplace |
+| `cppp` | Central Public Procurement Portal |
+| `tn` | Tamil Nadu GePNIC |
+| `nic-mp` | Madhya Pradesh GePNIC |
+| `nic-odisha` | Odisha GePNIC |
+| `nic-chandigarh` | Chandigarh GePNIC |
+| `nic-delhi` | Delhi GePNIC |
+| `nic-coal` | Coal India GePNIC |
+| `nic-iocl` | Indian Oil GePNIC |
+| `nic-ntpc` | NTPC GePNIC |
+| `nic-cpcl` | CPCL GePNIC |
+| `nic-bhel` | BHEL GePNIC |
 
-## STEP 1: Create a GitHub Account
-Go to https://github.com and sign up (free).
+The `nic-*` jobs use the existing GePNIC extraction flow with a portal-specific base URL and database portal ID. They are not enabled for sites with different platforms such as Bihar e-Procurement 2.0 or Telangana's state portal.
 
----
+GeM is read from its public bid-listing page using the rendered bid cards and the page's own pagination. It reads at most 50 pages by default; set `GEM_MAX_PAGES` to change that limit. The GePNIC and CPPP scrapers use their own per-tab page limits (`TN_MAX_PAGES_PER_TAB` and `CPPP_MAX_PAGES_PER_TAB`), each defaulting to 100.
 
-## STEP 2: Create a New Repository
+## Requirements
 
-1. Click **New Repository**
-2. Name it: `tenderpilot-scraper`
-3. Set it to **Public** (unlimited free minutes)
-4. Click **Create Repository**
+- Node.js 22.x
+- Chromium (installed by Playwright)
+- A Supabase project with the schema in `schema.sql`
 
----
+Install from the repository root:
 
-## STEP 3: Upload Your Code
-
-Upload all files maintaining this structure:
-```
-tenderpilot-scraper/
-├── .github/
-│   └── workflows/
-│       └── scraper.yml
-├── scrapers/
-│   ├── base.js
-│   ├── gem.js
-│   ├── cppp.js
-│   └── tn.js
-├── captcha/
-│   ├── captcha_solver.py
-│   └── solver.js
-├── db/
-│   ├── schema.sql
-│   └── supabase.js
-├── config/
-│   └── logger.js
-└── package.json
+```sh
+npm ci
+npx playwright install chromium
 ```
 
----
+Python packages in `requirements.txt` are only needed if CAPTCHA-solving support is deliberately integrated. The current scrapers stop and report an error when they encounter a CAPTCHA; they do not invoke the OCR helper.
 
-## STEP 4: Add Supabase Secrets
+## Configure Supabase
 
-1. In your GitHub repo → click **Settings**
-2. Left sidebar → **Secrets and variables** → **Actions**
-3. Click **New repository secret** and add:
+Run the updated `schema.sql` in the Supabase SQL Editor before enabling the new portal jobs. It adds the fields the current scrapers write and updates the closing-soon view; the `ALTER TABLE ... IF NOT EXISTS` statements support databases created from the earlier schema. Add these repository secrets under **Settings → Secrets and variables → Actions**:
 
-| Secret Name | Value |
-|-------------|-------|
-| `SUPABASE_URL` | https://xxxxx.supabase.co |
-| `SUPABASE_KEY` | your anon/service key |
+| Secret | Value |
+|---|---|
+| `SUPABASE_URL` | Your Supabase project URL |
+| `SUPABASE_KEY` | A Supabase key allowed to write scraper records |
 
----
+For local runs, create a `.env` file in the repository root with the same variable names. Do not commit `.env` or secret keys.
 
-## STEP 5: Set Up Supabase Database
+## Run locally
 
-1. Supabase project → **SQL Editor**
-2. Paste and run full contents of `db/schema.sql`
-3. Confirm `tenders` and `scraper_logs` tables appear
+Run one scraper from the repository root:
 
----
+```sh
+node gem.js
+node cppp.js
+node tn.js
+node gepnic.js nic-mp
+node gepnic.js nic-odisha
+```
 
-## STEP 6: Test It Right Now
+The remaining `nic-*` IDs in the table above can be passed to `gepnic.js` the same way. In GitHub Actions, choose one portal or `all` from **Actions → TenderPilot Autonomous Scraper → Run workflow**.
 
-1. Go to **Actions** tab in your repo
-2. Click **TenderPilot Autonomous Scraper**
-3. Click **Run workflow** → **Run workflow**
-4. Watch all 3 portals run in parallel live
+## Check results
 
----
-
-## STEP 7: Verify Data
-
-Supabase → Table Editor → `tenders` — rows should appear after first run.
+Inspect tender rows in Supabase's `tenders` table and recent run status with:
 
 ```sql
 SELECT * FROM scraper_health;
 SELECT * FROM scraper_logs ORDER BY ran_at DESC LIMIT 20;
 ```
 
----
-
-## Schedule
-
-```
-Every 2 hours, 24/7:
-  GeM + CPPP + TN all run simultaneously
-  Each run takes ~20-40 minutes
-  Data uploads to Supabase automatically
-```
-
----
-
-## Free Tier Limits
-
-| Resource | GitHub Free | Your Usage |
-|----------|------------|------------|
-| Minutes/month | Unlimited (public repo) | ~360 min |
-| Concurrent jobs | 20 | 3 |
-
-## Total Cost: ₹0/month ✅
+Logs are written under `logs/` and uploaded as a GitHub Actions artifact after each run.

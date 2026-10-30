@@ -6,7 +6,7 @@ const logger = winston.createLogger({
   format: winston.format.combine(
     winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
     winston.format.printf(({ timestamp, level, message, portal }) => {
-      const tag = (portal || 'SYSTEM').toUpperCase();
+      const tag = (portal || process.env.PORTAL || process.env.GEPNIC_PORTAL_ID || 'SYSTEM').toUpperCase();
       return `[${timestamp}] [${tag}] ${level.toUpperCase()}: ${message}`;
     })
   ),

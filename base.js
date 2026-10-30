@@ -134,7 +134,12 @@ class BaseScraper {
 
   async cleanup() {
     if (this.browser) {
-      await this.browser.close();
+      try {
+        await this.browser.close();
+      } catch (err) {
+        // A canceled Playwright run may already have closed the browser.
+        logger.warn(`Browser cleanup failed: ${err.message}`, { portal: this.portal });
+      }
       this.browser = null;
       this.page    = null;
     }

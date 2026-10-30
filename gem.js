@@ -1,178 +1,152 @@
 require('dotenv').config();
 
-const axios = require('axios');
+const BaseScraper = require('./base');
 const { upsertTenders, logScraperRun } = require('./supabase');
 const logger = require('./logger');
 
 const PORTAL = 'gem';
+process.env.PORTAL = process.env.PORTAL || PORTAL;
+const HOME_URL = 'https://bidplus.gem.gov.in/all-bids';
+const MAX_PAGES = Number.parseInt(process.env.GEM_MAX_PAGES, 10) || 50;
+const CARD_SELECTOR = '#bidCard .card';
 
-const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Accept': 'application/json, text/javascript, */*; q=0.01',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'Referer': 'https://bidplus.gem.gov.in/all-bids',
-  'X-Requested-With': 'XMLHttpRequest',
-};
+function parseDate(raw) {
+  if (!raw) return null;
+  // GeM displays bid end dates in India Standard Time.
+  const match = String(raw).trim().match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM))?$/i);
+  if (!match) {
+    const parsed = new Date(raw);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  }
+  const [, dayText, monthText, yearText, hourText, minuteText, secondText, meridiem] = match;
+  const day = Number(dayText);
+  const month = Number(monthText) - 1;
+  const year = Number(yearText);
+  let hour = Number(hourText || 0);
+  const minute = Number(minuteText || 0);
+  const second = Number(secondText || 0);
+  if (meridiem) hour = hour % 12 + (meridiem.toUpperCase() === 'PM' ? 12 : 0);
+  if (month < 0 || month > 11 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return null;
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function parseValue(str) {
-  if (!str) return null;
-  const num = parseFloat(String(str).replace(/[₹,\s]/g, ''));
-  return isNaN(num) ? null : num;
-}
-
-function parseDate(str) {
-  if (!str) return null;
-  try { const d = new Date(str); return isNaN(d.getTime()) ? null : d.toISOString(); } catch { return null; }
+  const hasTime = Boolean(hourText);
+  const utc = Date.UTC(year, month, day, hour, minute, second) - (hasTime ? 330 * 60 * 1000 : 0);
+  const parsed = new Date(utc);
+  if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month || parsed.getUTCDate() !== day) return null;
+  return parsed.toISOString();
 }
 
 function makeTenderId(raw) {
   return `GEM-${String(raw).replace(/\s+/g, '').substring(0, 100)}`;
 }
 
-// Try multiple known GeM API endpoints
-async function fetchPage(page) {
-  const endpoints = [
-    `https://bidplus.gem.gov.in/bidding/bid/getBidPageData?searchIndex=ra&page=${page}`,
-    `https://bidplus.gem.gov.in/all-bids?page=${page}`,
-    `https://bidplus.gem.gov.in/bidding/bid/getBidPageData?page=${page}`,
-  ];
+class GemScraper extends BaseScraper {
+  constructor() { super(PORTAL); }
 
-  for (const url of endpoints) {
+  async run() {
+    const startTime = Date.now();
+    const seenIds = new Set();
+    let tendersFetched = 0;
+
     try {
-      logger.info(`[GeM] Trying: ${url}`);
-      const res = await axios.get(url, { headers: HEADERS, timeout: 30000 });
-      // Log the top-level keys to debug structure
-      if (res.data && typeof res.data === 'object') {
-        logger.info(`[GeM] Response keys: ${Object.keys(res.data).join(', ')}`);
+      await this.launchBrowser();
+      const ok = await this.navigateTo(HOME_URL);
+      if (!ok) throw new Error('Failed to load GeM bid listing');
+      await this.page.waitForSelector(CARD_SELECTOR, { timeout: 20000 });
+
+      const totalText = await this.page.textContent('#bidCard .totalRecord').catch(() => '');
+      const totalMatch = totalText?.match(/of\s+([\d,]+)\s+records/i);
+      const totalRecords = totalMatch ? Number(totalMatch[1].replace(/,/g, '')) : null;
+      const firstPageCards = await this.page.$$(CARD_SELECTOR);
+      const pageSize = firstPageCards.length || 10;
+      const totalPages = totalRecords ? Math.ceil(totalRecords / pageSize) : MAX_PAGES;
+      const pagesToRead = Math.min(MAX_PAGES, totalPages);
+
+      logger.info(`[GeM] Listing reports ${totalRecords ?? 'an unknown number of'} bids; reading up to ${pagesToRead} pages`);
+
+      for (let pageNumber = 1; pageNumber <= pagesToRead; pageNumber++) {
+        const tenders = await this._readCurrentPage();
+        const fresh = tenders.filter(t => t && !seenIds.has(t.tender_id));
+        fresh.forEach(t => seenIds.add(t.tender_id));
+
+        if (fresh.length) {
+          await upsertTenders(fresh);
+          tendersFetched += fresh.length;
+        }
+        logger.info(`[GeM] Page ${pageNumber}/${pagesToRead}: ${tenders.length} cards, ${fresh.length} new tenders`);
+
+        if (tenders.length === 0 || pageNumber >= pagesToRead) break;
+        const next = await this.page.$('.pagination2 a.page-link.next');
+        if (!next || !(await next.isVisible().catch(() => false)) || !(await next.isEnabled().catch(() => false))) break;
+        const nextDisabled = await next.evaluate(el => el.closest('li')?.classList.contains('disabled') || el.getAttribute('aria-disabled') === 'true').catch(() => false);
+        if (nextDisabled) break;
+
+        const before = await this._pageFingerprint();
+        await next.click();
+        try {
+          await this.page.waitForFunction((previous) => {
+            const cards = Array.from(document.querySelectorAll('#bidCard .card .bid_no_hover'));
+            const current = cards.map(a => a.textContent.trim()).join('|');
+            return current && current !== previous;
+          }, before, { timeout: 15000 });
+        } catch (err) {
+          logger.warn(`[GeM] Stopping pagination because the listing did not change: ${err.message}`);
+          break;
+        }
+        await this.randomDelay(500, 1200);
       }
-      return res.data;
+
+      const duration = Math.round((Date.now() - startTime) / 1000);
+      await logScraperRun({ portal: PORTAL, status: 'success', count: tendersFetched });
+      logger.info(`[GeM] Done: ${tendersFetched} tenders in ${duration}s`);
     } catch (err) {
-      logger.warn(`[GeM] Endpoint failed (${url}): ${err.message}`);
+      logger.error(`[GeM] Fatal: ${err.message}`);
+      await logScraperRun({ portal: PORTAL, status: 'error', message: err.message, count: tendersFetched });
+      process.exitCode = 1;
+    } finally {
+      await this.cleanup();
     }
   }
-  throw new Error('All GeM endpoints failed');
-}
 
-function extractRows(data) {
-  if (!data) return [];
-  // Try every known path
-  const candidates = [
-    data?.data?.data,
-    data?.data?.bids,
-    data?.data?.result,
-    data?.data,
-    data?.bids,
-    data?.result,
-    data?.records,
-    data?.items,
-    data?.list,
-    data?.content,
-    data?.bidList,
-    data?.bidlist,
-    data?.tenders,
-  ];
-  for (const c of candidates) {
-    if (Array.isArray(c) && c.length > 0) {
-      logger.info(`[GeM] Found rows array with ${c.length} items`);
-      return c;
-    }
+  async _readCurrentPage() {
+    return await this.page.$$eval(CARD_SELECTOR, cards => cards.map(card => {
+      const bidLink = card.querySelector('a.bid_no_hover[href]');
+      const itemColumn = card.querySelector('.card-body .col-md-4');
+      const itemLink = itemColumn?.querySelector('a[data-content]') || itemColumn?.querySelector('a');
+      const itemRow = itemColumn?.querySelector('.row');
+      const department = card.querySelector('.card-body .col-md-5 .row:nth-child(2)');
+      const endDate = card.querySelector('.card-body .end_date');
+      const bidNumber = bidLink?.textContent?.trim() || '';
+      const href = bidLink?.getAttribute('href') || '';
+      const title = itemLink?.getAttribute('data-content')?.trim()
+        || itemLink?.textContent?.trim()
+        || itemRow?.innerText?.replace(/^Items:\s*/i, '').trim()
+        || '';
+      const organization = department?.innerText?.trim().replace(/\s+/g, ' ') || '';
+      const detailUrl = href ? new URL(href, window.location.href).href : '';
+      if (!bidNumber || !title) return null;
+      return { bidNumber, title, organization, endDate: endDate?.textContent?.trim() || '', detailUrl };
+    })).then(cards => cards.filter(Boolean).map(card => ({
+      portal: PORTAL,
+      tender_id: makeTenderId(card.bidNumber),
+      title: card.title.substring(0, 500),
+      organization: card.organization.substring(0, 300),
+      bid_end_date: parseDate(card.endDate),
+      detail_url: card.detailUrl.substring(0, 1000),
+      url: card.detailUrl.substring(0, 1000),
+      scraped_at: new Date().toISOString(),
+    })));
   }
-  // Log the full structure for debugging (first 500 chars)
-  logger.warn(`[GeM] Could not find rows. Data snippet: ${JSON.stringify(data).substring(0, 500)}`);
-  return [];
-}
 
-async function scrapeGeM() {
-  const startTime = Date.now();
-  const allTenders = [];
-  let page = 1;
-  let totalPages = 1;
-  let tendersFetched = 0;
-
-  logger.info(`[${PORTAL}] Starting scrape`);
-
-  try {
-    while (page <= Math.min(totalPages, 50)) {
-      logger.info(`[${PORTAL}] Fetching page ${page} of ${totalPages}`);
-
-      let data;
-      try {
-        data = await fetchPage(page);
-      } catch (err) {
-        logger.error(`[${PORTAL}] Failed to fetch page ${page}: ${err.message}`);
-        break;
-      }
-
-      const rows = extractRows(data);
-      if (rows.length === 0) {
-        logger.warn(`[${PORTAL}] No rows on page ${page}, stopping`);
-        break;
-      }
-
-      if (page === 1) {
-        const total = data?.data?.total || data?.total || data?.totalRecords || data?.count || 0;
-        totalPages = total ? Math.ceil(total / rows.length) : 1;
-        totalPages = Math.min(totalPages, 50);
-        logger.info(`[${PORTAL}] Total: ${total}, pages: ${totalPages}`);
-      }
-
-      for (const row of rows) {
-        // Try every known field name for bid ID
-        const rawId = row.bid_number || row.bidNumber || row.bid_no || row.bidNo
-                   || row.id || row.tenderId || row.tender_id || '';
-        if (!rawId) continue;
-
-        const tender = {
-          portal:          PORTAL,
-          tender_id:       makeTenderId(rawId),
-          title:           String(
-            row.bid_item_description || row.itemDescription || row.item_description
-            || row.name || row.title || row.subject || ''
-          ).substring(0, 1000),
-          organization:    String(
-            row.buying_org_name || row.buyerOrgName || row.buyer_org_name
-            || row.department || row.ministry || row.org_name || ''
-          ).substring(0, 500),
-          bid_end_date:    parseDate(
-            row.bid_submission_end_date || row.endDate || row.end_date
-            || row.closing_date || row.closingDate || row.bid_end_date
-          ),
-          estimated_value: parseValue(
-            row.consignee_quantity_value || row.estimatedValue || row.estimated_value
-            || row.value || row.amount
-          ),
-          detail_url: `https://bidplus.gem.gov.in/bidlists/detail/${rawId}`.substring(0, 1000),
-          url:        `https://bidplus.gem.gov.in/bidlists/detail/${rawId}`.substring(0, 1000),
-          scraped_at: new Date().toISOString(),
-        };
-
-        allTenders.push(tender);
-        tendersFetched++;
-      }
-
-      logger.info(`[${PORTAL}] Page ${page}: ${rows.length} rows (total: ${tendersFetched})`);
-      page++;
-      if (page <= totalPages) await sleep(1500);
-    }
-
-    logger.info(`[${PORTAL}] Scrape complete. Total: ${tendersFetched}`);
-
-    if (allTenders.length > 0) {
-      await upsertTenders(allTenders);
-    }
-
-    const duration = Math.round((Date.now() - startTime) / 1000);
-    await logScraperRun({ portal: PORTAL, status: 'success', count: tendersFetched });
-    logger.info(`[${PORTAL}] Done in ${duration}s`);
-    process.exit(0);
-
-  } catch (err) {
-    logger.error(`[${PORTAL}] Fatal: ${err.message}`);
-    await logScraperRun({ portal: PORTAL, status: 'error', message: err.message, count: tendersFetched }).catch(() => {});
-    process.exit(1);
+  async _pageFingerprint() {
+    return await this.page.$$eval('#bidCard .card .bid_no_hover', links => links.map(a => a.textContent.trim()).join('|'));
   }
 }
 
-scrapeGeM();
+if (require.main === module) {
+  new GemScraper().run().catch((err) => {
+    logger.error(`[GeM] Unhandled error: ${err.message}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { GemScraper, parseDate, makeTenderId };
