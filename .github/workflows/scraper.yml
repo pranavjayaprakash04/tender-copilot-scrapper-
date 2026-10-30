@@ -31,7 +31,8 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      max-parallel: 6
+      # Limit concurrent writes so Supabase does not cancel upserts under load.
+      max-parallel: 3
       matrix:
         portal: [gem, cppp, tn, nic-mp, nic-odisha, nic-chandigarh, nic-delhi, nic-coal, nic-iocl, nic-ntpc, nic-cpcl, nic-bhel]
     name: Scrape ${{ matrix.portal }}

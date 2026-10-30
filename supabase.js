@@ -57,15 +57,29 @@ async function upsertTenders(tenders) {
     return;
   }
 
-  const BATCH = 50;
+  // Small batches reduce statement time and lock pressure when several portal
+  // jobs share a Supabase project.
+  const BATCH = 10;
   for (let i = 0; i < unique.length; i += BATCH) {
     const batch = unique.slice(i, i + BATCH);
-    const { error } = await supabase
-      .from('tenders')
-      .upsert(batch, { onConflict: 'tender_id', ignoreDuplicates: false });
-    if (error) {
-      logger.error(`Supabase upsert error: ${error.message}`);
-      throw error;
+    const maxAttempts = 4;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const { error } = await supabase
+        .from('tenders')
+        .upsert(batch, { onConflict: 'tender_id', ignoreDuplicates: false });
+      if (!error) break;
+
+      const retryable = ['57014', '53300', '57P01', '08000', '08003', '08006', '08001'].includes(error.code)
+        || [408, 429, 500, 502, 503, 504].includes(Number(error.status))
+        || /statement timeout|timed? ?out|temporarily unavailable|too many connections/i.test(error.message || '');
+      if (!retryable || attempt === maxAttempts) {
+        logger.error(`Supabase upsert error (batch ${Math.floor(i / BATCH) + 1}, attempt ${attempt}): ${error.message}`);
+        throw error;
+      }
+
+      const delayMs = 1500 * (2 ** (attempt - 1)) + Math.floor(Math.random() * 500);
+      logger.warn(`Supabase upsert batch ${Math.floor(i / BATCH) + 1} timed out; retrying in ${(delayMs / 1000).toFixed(1)}s (attempt ${attempt + 1}/${maxAttempts})`);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
     }
   }
 
