@@ -8,6 +8,7 @@ const PORTAL = 'gem';
 process.env.PORTAL = process.env.PORTAL || PORTAL;
 const HOME_URL = 'https://bidplus.gem.gov.in/all-bids';
 const MAX_PAGES = Number.parseInt(process.env.GEM_MAX_PAGES, 10) || 50;
+const NAVIGATION_RETRIES = Math.max(1, Number.parseInt(process.env.GEM_NAVIGATION_RETRIES, 10) || 5);
 const CARD_SELECTOR = '#bidCard .card';
 
 function parseDate(raw) {
@@ -49,8 +50,14 @@ class GemScraper extends BaseScraper {
 
     try {
       await this.launchBrowser();
-      const ok = await this.navigateTo(HOME_URL);
-      if (!ok) throw new Error('Failed to load GeM bid listing');
+      const ok = await this.navigateTo(HOME_URL, NAVIGATION_RETRIES, {
+        initialDelayMs: 5000,
+        maxDelayMs: 30000,
+      });
+      if (!ok) {
+        const reason = this.lastNavigationError?.message;
+        throw new Error(`Failed to load GeM bid listing after ${NAVIGATION_RETRIES} attempts${reason ? `; last error: ${reason}` : ''}`);
+      }
       await this.page.waitForSelector(CARD_SELECTOR, { timeout: 20000 });
 
       const totalText = await this.page.textContent('#bidCard .totalRecord').catch(() => '');

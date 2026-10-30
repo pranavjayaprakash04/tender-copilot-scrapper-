@@ -23,7 +23,7 @@ The GitHub Actions workflow runs each selected portal in its own job. Scheduled 
 
 The `nic-*` jobs use the existing GePNIC extraction flow with a portal-specific base URL and database portal ID. They are not enabled for sites with different platforms such as Bihar e-Procurement 2.0 or Telangana's state portal.
 
-GeM is read from its public bid-listing page using the rendered bid cards and the page's own pagination. It reads at most 50 pages by default; set `GEM_MAX_PAGES` to change that limit. The GePNIC and CPPP scrapers use their own per-tab page limits (`TN_MAX_PAGES_PER_TAB` and `CPPP_MAX_PAGES_PER_TAB`), each defaulting to 100.
+GeM is read from its public bid-listing page using the rendered bid cards and the page's own pagination. It reads at most 50 pages by default; set `GEM_MAX_PAGES` to change that limit. Initial GeM navigation retries up to five times with exponential backoff; set `GEM_NAVIGATION_RETRIES` to change the attempt count. The GePNIC and CPPP scrapers use their own per-tab page limits (`TN_MAX_PAGES_PER_TAB` and `CPPP_MAX_PAGES_PER_TAB`), each defaulting to 100.
 
 ## Requirements
 

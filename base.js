@@ -80,17 +80,29 @@ class BaseScraper {
    * @param {number} retries
    * @returns {boolean} true on success, false after all retries exhausted
    */
-  async navigateTo(url, retries = 3) {
+  async navigateTo(url, retries = 3, retryOptions = {}) {
+    const initialDelayMs = Math.max(0, Number(retryOptions.initialDelayMs ?? 2000));
+    const maxDelayMs = Math.max(initialDelayMs, Number(retryOptions.maxDelayMs ?? 30000));
+    this.lastNavigationError = null;
+
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
         await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        this.lastNavigationError = null;
         return true;
       } catch (err) {
+        this.lastNavigationError = err;
         logger.warn(
           `Navigation failed (attempt ${attempt + 1}): ${err.message}`,
           { portal: this.portal }
         );
-        await this.randomDelay();
+        if (attempt + 1 < retries) {
+          const backoffMs = Math.min(initialDelayMs * (2 ** attempt), maxDelayMs);
+          const jitterMs = Math.floor(Math.random() * 1000);
+          const delayMs = backoffMs + jitterMs;
+          logger.info(`Retrying navigation in ${(delayMs / 1000).toFixed(1)}s`, { portal: this.portal });
+          await this.page.waitForTimeout(delayMs);
+        }
       }
     }
     return false;
