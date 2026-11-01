@@ -62,11 +62,12 @@ jobs:
 
       - name: Install Node dependencies
         if: steps.check.outputs.run == 'true'
-        run: npm ci
+        run: npm ci --no-audit --no-fund
 
       - name: Install Playwright Chromium
         if: steps.check.outputs.run == 'true'
-        run: npx playwright install chromium --with-deps
+        timeout-minutes: 10
+        run: npx playwright install chromium
 
       - name: Create logs directory
         if: steps.check.outputs.run == 'true'
@@ -78,6 +79,7 @@ jobs:
           PORTAL: ${{ matrix.portal }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GEM_HOME_URL: ${{ vars.GEM_HOME_URL }}
           REQUEST_DELAY_MIN: 2000
           REQUEST_DELAY_MAX: 5000
         run: |

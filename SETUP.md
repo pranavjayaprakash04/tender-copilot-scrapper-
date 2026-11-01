@@ -25,6 +25,8 @@ The `nic-*` jobs use the existing GePNIC extraction flow with a portal-specific 
 
 GeM is read from its public bid-listing page using the rendered bid cards and the page's own pagination. It reads at most 50 pages by default; set `GEM_MAX_PAGES` to change that limit. Initial GeM navigation retries up to five times with exponential backoff; set `GEM_NAVIGATION_RETRIES` to change the attempt count. The GePNIC and CPPP scrapers use their own per-tab page limits (`TN_MAX_PAGES_PER_TAB` and `CPPP_MAX_PAGES_PER_TAB`), each defaulting to 100.
 
+The GeM start URL defaults to `https://bidplus.gem.gov.in/all-bids`. To change it in GitHub Actions, add the optional Actions variable `GEM_HOME_URL`; local runs can set the same environment variable. A `ERR_CONNECTION_REFUSED` message means the remote host/network refused the connection before page content loaded. The job records that as an error and does not report an empty listing as a successful scrape; retry after the source is reachable. This is different from a selector or extraction failure.
+
 ## Requirements
 
 - Node.js 22.x
@@ -39,6 +41,8 @@ npx playwright install chromium
 ```
 
 Python packages in `requirements.txt` are only needed if CAPTCHA-solving support is deliberately integrated. The current scrapers stop and report an error when they encounter a CAPTCHA; they do not invoke the OCR helper.
+
+The Actions workflow installs the Chromium browser with a 10-minute step limit and does not run `--with-deps`, which invokes Linux package-manager updates. GitHub-hosted Ubuntu runners supply the system browser libraries; the Playwright-managed browser binary is installed per job.
 
 ## Configure Supabase
 

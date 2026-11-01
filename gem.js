@@ -6,7 +6,7 @@ const logger = require('./logger');
 
 const PORTAL = 'gem';
 process.env.PORTAL = process.env.PORTAL || PORTAL;
-const HOME_URL = 'https://bidplus.gem.gov.in/all-bids';
+const HOME_URL = process.env.GEM_HOME_URL || 'https://bidplus.gem.gov.in/all-bids';
 const MAX_PAGES = Number.parseInt(process.env.GEM_MAX_PAGES, 10) || 50;
 const NAVIGATION_RETRIES = Math.max(1, Number.parseInt(process.env.GEM_NAVIGATION_RETRIES, 10) || 5);
 const CARD_SELECTOR = '#bidCard .card';
@@ -56,7 +56,11 @@ class GemScraper extends BaseScraper {
       });
       if (!ok) {
         const reason = this.lastNavigationError?.message;
-        throw new Error(`Failed to load GeM bid listing after ${NAVIGATION_RETRIES} attempts${reason ? `; last error: ${reason}` : ''}`);
+        const connectionRefused = /ERR_CONNECTION_REFUSED|ECONNREFUSED/i.test(reason || '');
+        const cause = connectionRefused
+          ? 'The GeM host refused the TCP connection; this is an upstream/network availability failure, not a tender-page parsing error'
+          : reason ? `Last navigation error: ${reason}` : 'No navigation error details were provided';
+        throw new Error(`Failed to load GeM bid listing after ${NAVIGATION_RETRIES} attempts. ${cause}`);
       }
       await this.page.waitForSelector(CARD_SELECTOR, { timeout: 20000 });
       const existingApplyUrls = await this._fetchExistingApplyUrls();
